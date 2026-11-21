@@ -369,7 +369,7 @@ devm_request_mem_region(struct device *dev, resource_size_t start, resource_size
 	return (&appledrm_dummy_region);
 }
 
-/* Non-RAM mappings made by appledrm_memremap(), for memunmap(). */
+/* Mappings outside the direct map, tracked for memunmap(). */
 struct memremap_ent {
 	struct list_head	list;
 	void			*va;
@@ -382,7 +382,6 @@ void *
 appledrm_memremap(resource_size_t offset, size_t size, unsigned long flags)
 {
 	struct memremap_ent *e;
-	vm_offset_t base;
 	void *va;
 
 	if (size == 0)
@@ -396,16 +395,18 @@ appledrm_memremap(resource_size_t offset, size_t size, unsigned long flags)
 		printf("appledrm: memremap pa %#jx size %#zx: DMAP -> %p\n", (uintmax_t)offset, size, va);
 		return (va);
 	}
-	base = (vm_offset_t)pmap_mapdev_attr(trunc_page(offset),
-	    round_page(offset + size) - trunc_page(offset),
-	    (flags & MEMREMAP_WC) ? VM_MEMATTR_WRITE_COMBINING : VM_MEMATTR_DEFAULT);
-	if (base == 0)
-		return (NULL);
-	va = (void *)(base + (offset & PAGE_MASK));
-	printf("appledrm: memremap pa %#jx size %#zx: mapdev -> %p\n", (uintmax_t)offset, size, va);
 	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (e == NULL)
+		return (NULL);
+	va = pmap_mapdev_attr(offset, size,
+	    (flags & MEMREMAP_WC) ? VM_MEMATTR_WRITE_COMBINING : VM_MEMATTR_DEFAULT);
+	if (va == NULL) {
+		kfree(e);
+		return (NULL);
+	}
+	printf("appledrm: memremap pa %#jx size %#zx: mapdev -> %p\n", (uintmax_t)offset, size, va);
 	e->va = va;
-	e->size = round_page(offset + size) - trunc_page(offset);
+	e->size = size;
 	spin_lock(&memremap_lock);
 	list_add(&e->list, &memremap_list);
 	spin_unlock(&memremap_lock);
@@ -429,7 +430,7 @@ appledrm_memunmap(void *addr)
 		}
 	spin_unlock(&memremap_lock);
 	if (found != NULL) {
-		pmap_unmapdev((void *)trunc_page((vm_offset_t)addr), found->size);
+		pmap_unmapdev(addr, found->size);
 		kfree(found);
 	}
 }
