@@ -1135,7 +1135,17 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 			ret = agx_parse_render(&render,
 			    &job->commands[job->n_commands].pass);
 			if (ret != 0) {
-				printf("agxdrm: render refused: %d\n", ret);
+				printf("agxdrm: render refused: %d: %ux%u, %u "
+				    "samples, %u B/sample, utile %ux%u, flags %#x, "
+				    "zls %#jx, depth %#jx/%#jx, stencil %#jx/%#jx\n",
+				    ret, render.width_px, render.height_px,
+				    render.samples, render.sample_size_B,
+				    render.utile_width_px, render.utile_height_px,
+				    render.flags, (uintmax_t)render.zls_ctrl,
+				    (uintmax_t)render.depth.base,
+				    (uintmax_t)render.depth.comp_base,
+				    (uintmax_t)render.stencil.base,
+				    (uintmax_t)render.stencil.comp_base);
 				return (ret);
 			}
 			job->n_commands++;
