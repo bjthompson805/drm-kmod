@@ -50,6 +50,7 @@
 struct agx_queue {
 	struct list_head	link;
 	struct workqueue_struct	*submit_wq;
+	struct dma_fence	*last_render;	/* owned by submit_wq */
 	atomic_t		pending;
 	u64			fence_context;
 	u64			fence_seqno;
@@ -194,6 +195,7 @@ static void
 agx_free_queue(struct agx_queue *queue)
 {
 	destroy_workqueue(queue->submit_wq);
+	dma_fence_put(queue->last_render);
 	kfree(queue);
 }
 
@@ -839,6 +841,9 @@ agx_record_job_error(struct agx_drm *agx, struct agx_vm *vm, int error,
 	mutex_unlock(&agx->lock);
 }
 
+static void agx_job_finish(struct agx_job *job, int ret, bool gpu_failed);
+static void agx_job_render_done(void *arg, int error);
+
 static void
 agx_run_job(struct work_struct *work)
 {
@@ -846,7 +851,6 @@ agx_run_job(struct work_struct *work)
 	struct agx_drm *agx = job->agx;
 	struct agx_vm *vm = job->vm;
 	struct agx_queue *queue = job->queue;
-	bool queue_idle;
 	long waited;
 	u32 i;
 	int ret;
@@ -885,17 +889,67 @@ agx_run_job(struct work_struct *work)
 	}
 	mutex_unlock(&agx->lock);
 	for (i = 0; i < job->n_commands && ret == 0; i++) {
-		if (job->commands[i].render)
+		struct agx_command *c = &job->commands[i];
+
+		/*
+		 * The job's last render returns once published: its
+		 * completion finishes the job, so the queue's next job can
+		 * publish behind it.
+		 */
+		if (c->render && i == job->n_commands - 1) {
+			struct dma_fence *fence = dma_fence_get(job->done);
+
+			ret = -apple_agx_submit_render_async(agx->gpu,
+			    vm->context, &c->pass, c->programs, c->nprograms,
+			    agx_job_render_done, job);
+			if (ret == 0) {
+				dma_fence_put(queue->last_render);
+				queue->last_render = fence;
+				return;
+			}
+			dma_fence_put(fence);
+			gpu_failed = ret != -EINVAL && ret != -E2BIG &&
+			    ret != -EOPNOTSUPP;
+			break;
+		}
+		/* The compute ring has no dependency on the render pair. */
+		if (!c->render && queue->last_render != NULL) {
+			ret = dma_fence_wait(queue->last_render, false);
+			if (ret == 0)
+				ret = min(0, dma_fence_get_status(queue->last_render));
+			dma_fence_put(queue->last_render);
+			queue->last_render = NULL;
+			if (ret != 0)
+				break;
+		}
+		if (c->render)
 			ret = -apple_agx_submit_render(agx->gpu, vm->context,
-			    &job->commands[i].pass, job->commands[i].programs,
-			    job->commands[i].nprograms, 0);
+			    &c->pass, c->programs, c->nprograms, 0);
 		else
 			ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
-			    vm->context, job->commands[i].start,
-			    job->commands[i].end, 0);
+			    vm->context, c->start, c->end, 0);
 		gpu_failed = ret != 0 && ret != -EINVAL && ret != -E2BIG &&
 		    ret != -EOPNOTSUPP;
 	}
+	agx_job_finish(job, ret, gpu_failed);
+}
+
+/* A job's last render retired or failed (apple_agx task thread). */
+static void
+agx_job_render_done(void *arg, int error)
+{
+	struct agx_job *job = arg;
+
+	agx_job_finish(job, -error, error != 0);
+}
+
+static void
+agx_job_finish(struct agx_job *job, int ret, bool gpu_failed)
+{
+	struct agx_drm *agx = job->agx;
+	struct agx_vm *vm = job->vm;
+	struct agx_queue *queue = job->queue;
+	bool queue_idle;
 
 	if (ret != 0) {
 		if (ret != -ECANCELED || gpu_failed)
