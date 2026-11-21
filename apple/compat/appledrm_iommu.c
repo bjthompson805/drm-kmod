@@ -19,6 +19,7 @@
 #include <linux/dma-map-ops.h>
 #include <linux/scatterlist.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/of_platform.h>
@@ -326,10 +327,65 @@ iommu_put_resv_regions(struct device *dev, struct list_head *list)
 	}
 }
 
-/* dma-iommu: MSI regions; Apple DARTs have none here. */
+/* Read the firmware's device-tree reservations for this DMA master. */
 void
 iommu_dma_get_resv_regions(struct device *dev, struct list_head *list)
 {
+	struct device_node *np = dev->of_node;
+	int count, prot;
+
+	count = of_count_phandle_with_args(np, "memory-region", NULL);
+	prot = IOMMU_READ | IOMMU_WRITE;
+	if (appledrm_dev_is_dma_coherent(dev))
+		prot |= IOMMU_CACHE;
+
+	for (int index = 0; index < count; index++) {
+		struct device_node *mem = of_parse_phandle(np, "memory-region", index);
+		struct resource phys = {};
+		const __be32 *maps, *end;
+		int len;
+
+		if (mem == NULL)
+			continue;
+		if (of_property_present(mem, "reg") && of_address_to_resource(mem, 0, &phys) != 0)
+			continue;
+		maps = of_get_property(mem, "iommu-addresses", &len);
+		if (maps == NULL || len <= 0 || len % sizeof(*maps) != 0)
+			continue;
+		end = maps + len / sizeof(*maps);
+
+		while (maps < end) {
+			struct device_node *owner = of_find_node_by_phandle(be32_to_cpup(maps++));
+			struct iommu_resv_region *region;
+			dma_addr_t iova;
+			size_t size;
+			int na, ns;
+
+			if (owner == NULL)
+				break;
+			na = of_n_addr_cells(owner);
+			ns = of_n_size_cells(owner);
+			if (na < 1 || na > 2 || ns < 1 || ns > 2 || na + ns > end - maps)
+				break;
+			iova = of_read_number(maps, na);
+			size = of_read_number(maps + na, ns);
+			maps += na + ns;
+			if (owner != np || size == 0 || size - 1 > ~(dma_addr_t)0 - iova)
+				continue;
+
+			if (phys.start >= phys.end)
+				region = iommu_alloc_resv_region(iova, size, prot,
+				    IOMMU_RESV_RESERVED, GFP_KERNEL);
+			else if (iova == phys.start && iova + size - 1 == phys.end)
+				region = iommu_alloc_resv_region(iova, size, prot,
+				    IOMMU_RESV_DIRECT, GFP_KERNEL);
+			else
+				region = iommu_alloc_resv_region_tr(phys.start, iova, size, prot,
+				    IOMMU_RESV_TRANSLATED, GFP_KERNEL);
+			if (region != NULL)
+				list_add_tail(&region->list, list);
+		}
+	}
 }
 
 /* ---- map / unmap (iommu.c) ---- */
@@ -621,6 +677,18 @@ out:
 	return (ret);
 }
 
+/*
+ * vmem takes space from the low end of a free extent. Reflect the aperture
+ * so allocation starts at the high end, as Linux does. On T8142 the low
+ * slots of the locked DART are still owned by the display firmware.
+ * Applying the same transform when freeing maps an IOVA back to its token.
+ */
+static dma_addr_t
+dma_iova_reflect(const struct appledrm_dma_cookie *c, dma_addr_t start, size_t size)
+{
+	return (c->base + (c->end - start) - (size - 1));
+}
+
 /* iommu_dma_init_domain(): IOVA arena over the aperture minus reserved regions. */
 static int
 iommu_dma_init_domain(struct iommu_domain *domain, struct device *dev)
@@ -649,6 +717,7 @@ iommu_dma_init_domain(struct iommu_domain *domain, struct device *dev)
 		dma_addr_t s = entry->type == IOMMU_RESV_TRANSLATED ? entry->dva : entry->start;
 		dma_addr_t e = s + entry->length;
 		vmem_addr_t got;
+		size_t size;
 
 		if (entry->type == IOMMU_RESV_MSI || entry->type == IOMMU_RESV_SW_MSI)
 			continue;
@@ -659,7 +728,10 @@ iommu_dma_init_domain(struct iommu_domain *domain, struct device *dev)
 		s = MAX(s, base);
 		e = MIN(e, end + 1);
 		/* Overlapping regions may already be carved out; ignore failures. */
-		vmem_xalloc(c->arena, e - s, 0, 0, 0, s, e, M_NOWAIT | M_BESTFIT, &got);
+		size = e - s;
+		s = dma_iova_reflect(c, s, size);
+		vmem_xalloc(c->arena, size, 0, 0, 0, s, s + size - 1,
+		    M_NOWAIT | M_BESTFIT, &got);
 	}
 	iommu_put_resv_regions(dev, &resv);
 	domain->cookie_type = IOMMU_COOKIE_DMA_IOVA;
@@ -884,18 +956,28 @@ dma_map_phys(struct device *dev, vm_paddr_t pa, size_t *sizep, bool mmio)
 {
 	struct iommu_domain *d;
 	struct appledrm_dma_cookie *c = dev_dma_cookie(dev, &d);
-	vmem_addr_t iova;
+	vmem_addr_t token;
+	dma_addr_t iova;
 	size_t size;
+	int ret;
 
-	if (c == NULL)
-		return (d == NULL ? (dma_addr_t)pa : DMA_MAPPING_ERROR);
+	if (c == NULL) {
+		if (d == NULL)
+			return ((dma_addr_t)pa);
+		dev_err(dev, "DMA map has no IOVA allocator (domain type %#x)\n", d->type);
+		return (DMA_MAPPING_ERROR);
+	}
 	size = roundup(*sizep, c->granule);
-	if (vmem_alloc(c->arena, size, M_NOWAIT | M_BESTFIT, &iova) != 0) {
+	if (vmem_alloc(c->arena, size, M_NOWAIT | M_BESTFIT, &token) != 0) {
 		dev_err(dev, "out of IOVA space (0x%zx)\n", size);
 		return (DMA_MAPPING_ERROR);
 	}
-	if (iommu_map(d, iova, pa, size, dma_prot(dev, mmio), GFP_KERNEL) != 0) {
-		vmem_free(c->arena, iova, size);
+	iova = dma_iova_reflect(c, token, size);
+	ret = iommu_map(d, iova, pa, size, dma_prot(dev, mmio), GFP_KERNEL);
+	if (ret != 0) {
+		dev_err(dev, "DMA map failed: IOVA %#jx PA %#jx size %#zx: %d\n",
+		    (uintmax_t)iova, (uintmax_t)pa, size, ret);
+		vmem_free(c->arena, token, size);
 		return (DMA_MAPPING_ERROR);
 	}
 	*sizep = size;
@@ -911,7 +993,7 @@ dma_unmap_iova(struct device *dev, dma_addr_t iova, size_t size)
 	if (c == NULL)
 		return;
 	iommu_unmap(d, iova, size);
-	vmem_free(c->arena, iova, size);
+	vmem_free(c->arena, dma_iova_reflect(c, iova, size), size);
 }
 
 static void
@@ -968,8 +1050,10 @@ appledrm_dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *handle, gf
 	ma = appledrm_dev_is_dma_coherent(dev) ? VM_MEMATTR_DEFAULT : VM_MEMATTR_WRITE_COMBINING;
 	cpu = kmem_alloc_contig(asize, M_ZERO | ((gfp & M_NOWAIT) ? M_NOWAIT : M_WAITOK), 0,
 	    ~(vm_paddr_t)0, PAGE_SIZE, 0, ma);
-	if (cpu == NULL)
+	if (cpu == NULL) {
+		dev_err(dev, "DMA backing allocation failed: size %#zx\n", asize);
 		return (NULL);
+	}
 	pa = vtophys(cpu);
 	iova = dma_map_phys(dev, pa, &asize, false);
 	if (iova == DMA_MAPPING_ERROR) {
