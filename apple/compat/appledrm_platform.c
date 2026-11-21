@@ -269,7 +269,7 @@ appledrm_pdev_create(struct device_node *np, struct device *parent)
 		ap->own_child = bsddev;
 	}
 	bus_topo_unlock();
-	if (bsddev != NULL)
+	if (bsddev != NULL && device_get_desc(bsddev) == NULL)
 		device_set_desc_copy(bsddev, np->full_name);
 	pdev->dev.bsddev = bsddev;
 
@@ -352,7 +352,15 @@ appledrm_pdev_probe(struct platform_device *pdev)
 			goto fail;
 	}
 
-	ret = drv->probe(pdev);
+	{
+		extern int appledrm_errtrace_probing;
+
+		printf("appledrm: %s: %s probe start\n", pdev->dev.of_node->full_name,
+		    drv->driver.name);
+		atomic_add_int(&appledrm_errtrace_probing, 1);
+		ret = drv->probe(pdev);
+		atomic_subtract_int(&appledrm_errtrace_probing, 1);
+	}
 fail:
 	if (ret == 0) {
 		ap->bound = true;
@@ -363,12 +371,14 @@ fail:
 			ap->on_deferred = false;
 		}
 		mutex_unlock(&appledrm_plat_lock);
-		dev_info(&pdev->dev, "bound to %s\n", drv->driver.name);
+		printf("appledrm: %s bound to %s\n", pdev->dev.of_node->full_name, drv->driver.name);
 	} else {
 		pdev->dev.driver = NULL;
 		lkpi_devres_release_free_list(&pdev->dev);
 		INIT_LIST_HEAD(&pdev->dev.devres_head);
 		if (ret == -EPROBE_DEFER) {
+			printf("appledrm: %s: %s probe deferred\n", pdev->dev.of_node->full_name,
+			    drv->driver.name);
 			mutex_lock(&appledrm_plat_lock);
 			if (!ap->on_deferred) {
 				list_add_tail(&ap->deferred, &appledrm_deferred);
@@ -376,7 +386,7 @@ fail:
 			}
 			mutex_unlock(&appledrm_plat_lock);
 		} else
-			dev_err(&pdev->dev, "%s probe failed: %d\n", drv->driver.name, ret);
+			printf("appledrm: %s: %s probe failed: %d\n", pdev->dev.of_node->full_name, drv->driver.name, ret);
 	}
 	sx_xunlock(&appledrm_probe_sx);
 	if (ret == 0)
@@ -763,6 +773,9 @@ appledrm_irq_hook(struct appledrm_irq *ai)
 		return (0);
 	error = bus_setup_intr(ai->pdev->dev.bsddev, ai->res, INTR_TYPE_MISC | INTR_MPSAFE,
 	    NULL, appledrm_irq_handler, ai, &ai->tag);
+	if (error != 0)
+		printf("appledrm: %s: bus_setup_intr(%s) failed: %d\n",
+		    ai->pdev->dev.of_node->full_name, ai->name, error);
 	if (error == 0) {
 		bus_describe_intr(ai->pdev->dev.bsddev, ai->res, ai->tag, "%s", ai->name);
 		ai->enabled = true;
@@ -809,7 +822,15 @@ appledrm_request_threaded_irq(struct device *dev, unsigned int irq, irq_handler_
 	    RF_ACTIVE | ((flags & IRQF_SHARED) ? RF_SHAREABLE : 0));
 	if (ai->res == NULL) {
 		mutex_unlock(&appledrm_irq_lock);
+		printf("appledrm: %s: IRQ rid %d allocation failed\n",
+		    ai->pdev->dev.of_node->full_name, ai->rid);
 		return (-ENXIO);
+	}
+	{
+		int appledrm_irq_res_check(device_t, void *, int, const char *);
+
+		appledrm_irq_res_check(ai->pdev->dev.bsddev, ai->res, ai->rid,
+		    ai->pdev->dev.of_node->full_name);
 	}
 	ai->handler = handler;
 	ai->thread_fn = thread_fn;

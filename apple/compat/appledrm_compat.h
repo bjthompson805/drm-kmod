@@ -251,9 +251,9 @@ static inline void vm_flags_mod(struct vm_area_struct *vma, unsigned long set, u
 #endif
 
 /* Linux of: device tables are only for module autoloading. */
-#ifndef MODULE_DEVICE_TABLE_BUS_of
-#define MODULE_DEVICE_TABLE_BUS_of(_bus, _table)
-#endif
+/* LinuxKPI's makes a DRIVER_MODULE per table (named lkpi_<table>, which collide here). */
+#undef MODULE_DEVICE_TABLE
+#define MODULE_DEVICE_TABLE(_bus, _table)
 
 /* symbol_get(): optional cross-module hooks; none of those modules exist here. */
 #define symbol_get(x)	((typeof(&x))NULL)

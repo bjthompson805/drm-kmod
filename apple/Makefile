@@ -16,7 +16,7 @@ SRCS=	apple_drv.c apple_resume.c afk.c dcp.c dcp-fabric.c dcp-fabric-core.c dcp_
 	panelavep.c plane.c dcp-indicator.c \
 	rtkit.c rtkit-crashlog.c mailbox.c tunable.c io-pgtable-dart.c apple-dart.c \
 	drm_gem_dma_helper.c drm_fb_dma_helper.c drm_fbdev_dma.c drm_gem_fb_extra.c \
-	appledrm_of.c appledrm_platform.c appledrm_iommu.c appledrm_component.c appledrm_misc.c appledrm_module.c
+	appledrm_of.c appledrm_platform.c appledrm_iommu.c appledrm_component.c appledrm_misc.c appledrm_module.c appledrm_bsdres.c
 
 SRCS	+=			\
 	${LINUXKPI_GENSRCS}	\
@@ -65,3 +65,16 @@ CFLAGS+= -DDRM_SYSCTL_PARAM_PREFIX=_dri
 CWARNFLAGS += -Wno-macro-redefined -Wno-unused-label
 CFLAGS+= -ferror-limit=0
 CFLAGS.drm_gem_fb_extra.c+= -I${.CURDIR:H}/drivers/gpu/drm
+CFLAGS.apple-dart.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.io-pgtable-dart.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.mailbox.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.rtkit.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.dcp.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.apple_drv.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.afk.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.iomfb.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.iomfb_v27.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.appledrm_of.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.appledrm_platform.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.appledrm_iommu.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
+CFLAGS.appledrm_misc.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
