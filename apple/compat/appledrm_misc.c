@@ -369,18 +369,81 @@ devm_request_mem_region(struct device *dev, resource_size_t start, resource_size
 	return (&appledrm_dummy_region);
 }
 
+/* Non-RAM mappings made by appledrm_memremap(), for memunmap(). */
+struct memremap_ent {
+	struct list_head	list;
+	void			*va;
+	size_t			size;
+};
+static LIST_HEAD(memremap_list);
+static DEFINE_SPINLOCK(memremap_lock);
+
+void *
+appledrm_memremap(resource_size_t offset, size_t size, unsigned long flags)
+{
+	struct memremap_ent *e;
+	vm_offset_t base;
+	void *va;
+
+	if (size == 0)
+		return (NULL);
+	/*
+	 * Like Linux's memremap(MEMREMAP_WB): DRAM the direct map covers (also iBoot's reserved
+	 * top of RAM, outside phys_avail) through the DMAP; anything else gets a mapping.
+	 */
+	if (PHYS_IN_DMAP(offset) && PHYS_IN_DMAP(offset + size - 1)) {
+		va = (void *)PHYS_TO_DMAP(offset);
+		printf("appledrm: memremap pa %#jx size %#zx: DMAP -> %p\n", (uintmax_t)offset, size, va);
+		return (va);
+	}
+	base = (vm_offset_t)pmap_mapdev_attr(trunc_page(offset),
+	    round_page(offset + size) - trunc_page(offset),
+	    (flags & MEMREMAP_WC) ? VM_MEMATTR_WRITE_COMBINING : VM_MEMATTR_DEFAULT);
+	if (base == 0)
+		return (NULL);
+	va = (void *)(base + (offset & PAGE_MASK));
+	printf("appledrm: memremap pa %#jx size %#zx: mapdev -> %p\n", (uintmax_t)offset, size, va);
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	e->va = va;
+	e->size = round_page(offset + size) - trunc_page(offset);
+	spin_lock(&memremap_lock);
+	list_add(&e->list, &memremap_list);
+	spin_unlock(&memremap_lock);
+	return (va);
+}
+
+void
+appledrm_memunmap(void *addr)
+{
+	struct memremap_ent *e, *found = NULL;
+
+	if (addr == NULL || ((vm_offset_t)addr >= DMAP_MIN_ADDRESS &&
+	    (vm_offset_t)addr < DMAP_MAX_ADDRESS))
+		return;
+	spin_lock(&memremap_lock);
+	list_for_each_entry(e, &memremap_list, list)
+		if (e->va == addr) {
+			found = e;
+			list_del(&e->list);
+			break;
+		}
+	spin_unlock(&memremap_lock);
+	if (found != NULL) {
+		pmap_unmapdev((void *)trunc_page((vm_offset_t)addr), found->size);
+		kfree(found);
+	}
+}
+
 void *
 devm_memremap(struct device *dev, resource_size_t offset, size_t size, unsigned long flags)
 {
-	if (appledrm_pa_is_ram(offset) && appledrm_pa_is_ram(offset + size - 1))
-		return ((void *)PHYS_TO_DMAP(offset));
-	return (pmap_mapdev_attr(offset, size,
-	    (flags & MEMREMAP_WC) ? VM_MEMATTR_WRITE_COMBINING : VM_MEMATTR_DEFAULT));
+	return (appledrm_memremap(offset, size, flags));
 }
 
 void
 devm_memunmap(struct device *dev, void *addr)
 {
+	appledrm_memunmap(addr);
 }
 
 /* ---- DRM helpers missing from drm-kmod 6.12 ---- */

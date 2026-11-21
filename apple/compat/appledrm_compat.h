@@ -376,8 +376,11 @@ bool appledrm_pa_is_ram(vm_paddr_t pa);	/* inside a hardware RAM region (DMAP-co
 #define MEMREMAP_WC		(1 << 2)
 void *devm_memremap(struct device *dev, resource_size_t offset, size_t size, unsigned long flags);
 void devm_memunmap(struct device *dev, void *addr);
-#define memremap(o, s, f)	((void *)PHYS_TO_DMAP(o))
-#define memunmap(a)		do { } while (0)
+/* RAM through the DMAP; anything else (e.g. firmware DART tables in SRAM) gets a mapping. */
+void *appledrm_memremap(resource_size_t offset, size_t size, unsigned long flags);
+void appledrm_memunmap(void *addr);
+#define memremap(o, s, f)	appledrm_memremap(o, s, f)
+#define memunmap(a)		appledrm_memunmap(a)
 struct resource *devm_request_mem_region(struct device *dev, resource_size_t start,
     resource_size_t n, const char *name);
 
@@ -512,5 +515,10 @@ static inline bool strstarts(const char *str, const char *prefix)
 	return strncmp(str, prefix, strlen(prefix)) == 0;
 }
 #endif
+
+
+/* LinuxKPI's device_iommu_mapped() always says false; ours asks the IOMMU core. */
+bool appledrm_device_iommu_mapped(struct device *dev);
+#define device_iommu_mapped	appledrm_device_iommu_mapped
 
 #endif

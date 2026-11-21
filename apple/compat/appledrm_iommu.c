@@ -234,6 +234,23 @@ iommu_group_set_iommudata(struct iommu_group *group, void *iommu_data,
 	group->iommu_data_release = release;
 }
 
+int
+iommu_group_for_each_dev(struct iommu_group *group, void *data,
+    int (*fn)(struct device *, void *))
+{
+	struct group_dev *gd;
+	int ret = 0;
+
+	mutex_lock(&group->mutex);
+	list_for_each_entry(gd, &group->devices, list) {
+		ret = fn(gd->dev, data);
+		if (ret != 0)
+			break;
+	}
+	mutex_unlock(&group->mutex);
+	return (ret);
+}
+
 struct iommu_domain *
 iommu_get_domain_for_dev(struct device *dev)
 {
@@ -680,6 +697,8 @@ appledrm_iommu_probe_device(struct device *dev)
 	domain = group->default_domain;
 	if (domain == NULL) {
 		type = ops->def_domain_type != NULL ? ops->def_domain_type(dev) : 0;
+		printf("appledrm: %s: def_domain_type %#x (PAGE_SIZE %d)\n",
+		    dev->of_node != NULL ? dev->of_node->full_name : "?", type, (int)PAGE_SIZE);
 		if (type == 0)
 			type = IOMMU_DOMAIN_DMA;
 		if (type == IOMMU_DOMAIN_IDENTITY && ops->identity_domain != NULL)
@@ -731,6 +750,20 @@ err_release:
 	return (ret);
 }
 
+/* Undo of_dma_configure() state after a failure, so the next probe redoes it. */
+static void
+appledrm_iommu_forget(struct device *dev)
+{
+	struct appledrm_dev_iommu *adi;
+
+	if (dev->iommu == NULL)
+		return;
+	adi = container_of(dev->iommu, struct appledrm_dev_iommu, di);
+	kfree(adi->di.fwspec);
+	dev->iommu = NULL;
+	kfree(adi);
+}
+
 /* of_iommu_configure(): xlate every "iommus" entry, then probe. */
 int
 of_dma_configure(struct device *dev, struct device_node *np, bool force_dma)
@@ -747,24 +780,35 @@ of_dma_configure(struct device *dev, struct device_node *np, bool force_dma)
 
 		/* The DART binds on demand; probing may defer. */
 		ipdev = of_find_device_by_node(args.np);
-		if (ipdev == NULL || !device_is_bound(&ipdev->dev))
+		if (ipdev == NULL || !device_is_bound(&ipdev->dev) ||
+		    (iommu = iommu_from_fwnode(&args.np->fwnode)) == NULL) {
+			appledrm_iommu_forget(dev);
 			return (-EPROBE_DEFER);
-		iommu = iommu_from_fwnode(&args.np->fwnode);
-		if (iommu == NULL)
-			return (-EPROBE_DEFER);
+		}
 		ret = iommu_fwspec_init(dev, &args.np->fwnode);
-		if (ret != 0)
+		if (ret == 0)
+			ret = iommu->ops->of_xlate(dev, &args);
+		if (ret != 0) {
+			appledrm_iommu_forget(dev);
 			return (ret);
-		ret = iommu->ops->of_xlate(dev, &args);
-		if (ret != 0)
-			return (ret);
+		}
 	}
 	if (idx == 0)
 		return (0);		/* no IOMMU: DMA is IOVA == PA */
 	dev->iommu->iommu_dev = iommu;
-	return (appledrm_iommu_probe_device(dev));
+	ret = appledrm_iommu_probe_device(dev);
+	if (ret != 0)
+		appledrm_iommu_forget(dev);
+	return (ret);
 }
 
+
+/* LinuxKPI's device_iommu_mapped() is a stub returning false (appledrm_compat.h redirects). */
+bool
+appledrm_device_iommu_mapped(struct device *dev)
+{
+	return (dev->iommu != NULL && dev->iommu->iommu_dev != NULL && dev_group(dev) != NULL);
+}
 
 /* ---- DMA API over the device's DMA domain (dma-iommu.c in spirit) ---- */
 
