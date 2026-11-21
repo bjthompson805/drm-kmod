@@ -83,6 +83,38 @@ dma_fence_allocate_private_stub(ktime_t timestamp)
 	return (fence);
 }
 
+struct dma_software_fence {
+	struct dma_fence base;
+	spinlock_t lock;
+};
+
+static const char *
+dma_software_fence_get_name(struct dma_fence *fence)
+{
+	return ("software");
+}
+
+static const struct dma_fence_ops dma_software_fence_ops = {
+	.use_64bit_seqno = true,
+	.get_driver_name = dma_software_fence_get_name,
+	.get_timeline_name = dma_software_fence_get_name,
+};
+
+/* Allocate an unsignalled fence whose producer calls dma_fence_signal(). */
+struct dma_fence *
+linux_dma_fence_allocate_software(u64 context, u64 seqno)
+{
+	struct dma_software_fence *fence;
+
+	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
+	if (fence == NULL)
+		return (NULL);
+	spin_lock_init(&fence->lock);
+	dma_fence_init(&fence->base, &dma_software_fence_ops, &fence->lock,
+	    context, seqno);
+	return (&fence->base);
+}
+
 static atomic64_t dma_fence_context_counter = ATOMIC64_INIT(1);
 
 /*
