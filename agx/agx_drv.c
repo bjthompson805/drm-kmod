@@ -6,9 +6,9 @@
  *
  * Each DRM file has a hardware address space and ordered compute queue.
  * Each live queue leases one of the firmware compute channels.
- * GEM objects are physically contiguous. Render commands are refused: the
- * render features are advertised so that userspace builds its M5 render
- * submissions, which are logged (agx_capture) for the host reference.
+ * GEM objects are physically contiguous. Render commands run on the GPU's
+ * one render pair; the first few are also logged (agx_capture) for the
+ * host reference tools.
  */
 
 #include <sys/param.h>
@@ -37,6 +37,7 @@
 #include <drm/asahi_drm.h>
 
 #include <arm64/apple/apple_agx_api.h>
+#include <arm64/apple/apple_agx_render.h>
 
 #define	AGX_PAGE		0x4000ul	/* UAT page = kernel page */
 #define	AGX_MAX_COMMANDS	64
@@ -723,9 +724,12 @@ agx_ioctl_queue_destroy(struct drm_device *drm, void *data,
 	return (0);
 }
 
-struct agx_compute_range {
-	u64 start;
-	u64 end;
+struct agx_command {
+	bool			 render;
+	u64			 start;		/* compute: the CDM stream */
+	u64			 end;
+	uint8_t			 mesh_class;	/* render */
+	struct agx_render_pass	 pass;
 };
 
 struct agx_job {
@@ -736,7 +740,7 @@ struct agx_job {
 	struct dma_fence	*done;
 	struct dma_fence	*deps[AGX_MAX_SYNCS];
 	u32			 n_deps;
-	struct agx_compute_range commands[AGX_MAX_COMMANDS];
+	struct agx_command	 commands[AGX_MAX_COMMANDS];
 	u32			 n_commands;
 };
 
@@ -821,10 +825,16 @@ agx_run_job(struct work_struct *work)
 	}
 	mutex_unlock(&agx->lock);
 	for (i = 0; i < job->n_commands && ret == 0; i++) {
-		ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
-		    vm->context,
-		    job->commands[i].start, job->commands[i].end, 0);
-		gpu_failed = ret != 0;
+		if (job->commands[i].render)
+			ret = -apple_agx_submit_render(agx->gpu, vm->context,
+			    &job->commands[i].pass, job->commands[i].mesh_class,
+			    0);
+		else
+			ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
+			    vm->context, job->commands[i].start,
+			    job->commands[i].end, 0);
+		gpu_failed = ret != 0 && ret != -EINVAL && ret != -E2BIG &&
+		    ret != -EOPNOTSUPP;
 	}
 
 	if (ret != 0) {
@@ -870,41 +880,148 @@ agx_capture(u_int seq, u_int index, const struct drm_asahi_cmd_header *hdr,
 	}
 }
 
+/* The render flags command.rs admits on M5 that this driver advertises. */
+#define	AGX_RENDER_FLAGS	(DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES | \
+	DRM_ASAHI_RENDER_RSRC_SPEC_HI | DRM_ASAHI_RENDER_DBIAS_IS_INT | \
+	DRM_ASAHI_RENDER_SHADER_WRITES)
+
+static bool
+agx_helper_empty(const struct drm_asahi_helper_program *h)
+{
+	const u8 *b = (const u8 *)h;
+	size_t i;
+
+	for (i = 0; i < sizeof(*h); i++)
+		if (b[i] != 0)
+			return (false);
+	return (true);
+}
+
+/* command.rs Render validation and RenderPass mapping, M5 subset. */
+static int
+agx_parse_render(const struct drm_asahi_cmd_render *c, struct agx_render_pass *p)
+{
+	u32 samples_log2;
+
+	if ((c->flags & ~AGX_RENDER_FLAGS) != 0 ||
+	    c->width_px < 1 || c->width_px > 16384 ||
+	    c->height_px < 1 || c->height_px > 16384 ||
+	    c->layers < 1 || c->layers > 2048 ||
+	    !((c->utile_width_px == 16 && c->utile_height_px == 16) ||
+	    (c->utile_width_px == 32 && c->utile_height_px == 16) ||
+	    (c->utile_width_px == 32 && c->utile_height_px == 32)))
+		return (-EINVAL);
+	switch (c->samples) {
+	case 1: samples_log2 = 0; break;
+	case 2: samples_log2 = 1; break;
+	case 4: samples_log2 = 2; break;
+	case 8: samples_log2 = 3; break;
+	default: return (-EINVAL);
+	}
+	if ((u64)c->sample_size_B * c->utile_width_px * c->utile_height_px *
+	    c->samples > 65536 ||
+	    c->vdm_ctrl_stream_base == 0 || (c->vdm_ctrl_stream_base & 3) != 0 ||
+	    c->isp_scissor_base == 0 || (c->isp_scissor_base & 7) != 0 ||
+	    (c->isp_dbias_base & 7) != 0 || (c->isp_oclqry_base & 7) != 0 ||
+	    !agx_helper_empty(&c->vertex_helper) ||
+	    !agx_helper_empty(&c->fragment_helper))
+		return (-EINVAL);
+	memset(p, 0, sizeof(*p));
+	p->width = c->width_px;
+	p->height = c->height_px;
+	p->layers = c->layers;
+	p->utile_width = c->utile_width_px;
+	p->utile_height = c->utile_height_px;
+	p->samples_log2 = samples_log2;
+	p->sample_size = c->sample_size_B;
+	p->process_empty_tiles =
+	    (c->flags & DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES) != 0;
+	p->msaa_control = c->ppp_multisamplectl;
+	p->ppp_control = c->ppp_ctrl;
+	p->vdm_va = c->vdm_ctrl_stream_base;
+	p->scissor_va = c->isp_scissor_base;
+	p->depth_bias_va = c->isp_dbias_base;
+	p->depth_bias_is_int = (c->flags & DRM_ASAHI_RENDER_DBIAS_IS_INT) != 0;
+	p->shader_writes_memory = (c->flags & DRM_ASAHI_RENDER_SHADER_WRITES) != 0;
+	p->occlusion_query_va = c->isp_oclqry_base;
+	p->sampler_heap_va = c->sampler_heap;
+	p->sampler_count = c->sampler_count;
+	p->zls_control = c->zls_ctrl;
+	p->depth_dimensions = c->isp_zls_pixels;
+	p->depth = (struct agx_zls_surface){ c->depth.base, c->depth.comp_base,
+	    c->depth.stride, c->depth.comp_stride };
+	p->stencil = (struct agx_zls_surface){ c->stencil.base,
+	    c->stencil.comp_base, c->stencil.stride, c->stencil.comp_stride };
+	p->depth_clear = c->isp_bgobjdepth;
+	p->stencil_clear = c->isp_bgobjvals;
+	p->merge_upper_x = c->isp_merge_upper_x;
+	p->merge_upper_y = c->isp_merge_upper_y;
+	p->bg_offset = c->bg.usc;
+	p->bg_rsrc_spec = c->bg.rsrc_spec | (u64)c->bg_rsrc_spec_hi << 32;
+	p->partial_bg_offset = c->partial_bg.usc;
+	p->partial_bg_rsrc_spec = c->partial_bg.rsrc_spec |
+	    (u64)c->bg_partial_rsrc_spec_hi << 32;
+	p->eot_offset = c->eot.usc;
+	p->eot_rsrc_spec = c->eot.rsrc_spec | (u64)c->bg_eot_rsrc_spec_hi << 32;
+	p->partial_eot_offset = c->partial_eot.usc;
+	p->partial_eot_rsrc_spec = c->partial_eot.rsrc_spec |
+	    (u64)c->bg_eot_partial_rsrc_spec_hi << 32;
+	p->rsrc_spec_hi = (c->flags & DRM_ASAHI_RENDER_RSRC_SPEC_HI) != 0;
+	return (agx_m5_render_validate(p) != 0 ? -EOPNOTSUPP : 0);
+}
+
+/*
+ * render_resources.rs parse_v2, as far as this driver runs renders: the
+ * mesh class. SCS (ray-query scratch) and mesh programs are not run yet.
+ */
+static int
+agx_parse_programs(const u8 *b, u32 size, uint8_t *mesh_class)
+{
+	struct drm_asahi_render_program_v2 e;
+	u32 off;
+
+	if (size == 0 || size % sizeof(e) != 0)
+		return (-EINVAL);
+	*mesh_class = 0;
+	for (off = 0; off < size; off += sizeof(e)) {
+		memcpy(&e, b + off, sizeof(e));
+		if (e.reserved != 0 || e.legacy.flags != 0 || e.legacy.stage > 1)
+			return (-EINVAL);
+		if (e.scs_layout != 0 || e.intersection_pool != 0 ||
+		    (e.usage_flags & ~0u) != 0)
+			return (-EOPNOTSUPP);
+	}
+	return (0);
+}
+
 static int
 agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 {
 	static u_int capture_seq;
 	struct drm_asahi_cmd_header hdr;
 	struct drm_asahi_cmd_compute cmd;
+	struct drm_asahi_cmd_render render;
+	uint8_t mesh_class = 0;
 	u_int index, seq = 0;
-	bool render = false;
+	bool captured = false;
 	u32 off;
+	int ret;
 
 	for (off = 0, index = 0; off < size; off += hdr.size, index++) {
 		if (size - off < sizeof(hdr))
-			break;
-		memcpy(&hdr, buf + off, sizeof(hdr));
-		off += sizeof(hdr);
-		if (hdr.size > size - off)
-			break;
-		if (hdr.cmd_type == DRM_ASAHI_CMD_COMPUTE ||
-		    hdr.cmd_type == DRM_ASAHI_SET_COMPUTE_ATTACHMENTS)
-			continue;
-		if (!render)
-			seq = capture_seq++;
-		render = true;
-		agx_capture(seq, index, &hdr, buf + off);
-	}
-	if (render)
-		return (-EOPNOTSUPP);
-
-	for (off = 0; off < size; off += hdr.size) {
-		if (size - off < sizeof(hdr))
 			return (-EINVAL);
 		memcpy(&hdr, buf + off, sizeof(hdr));
 		off += sizeof(hdr);
 		if (hdr.size > size - off)
 			return (-EINVAL);
+		if (hdr.cmd_type != DRM_ASAHI_CMD_COMPUTE &&
+		    hdr.cmd_type != DRM_ASAHI_SET_COMPUTE_ATTACHMENTS &&
+		    capture_seq < 4) {
+			if (!captured)
+				seq = capture_seq++;
+			captured = true;
+			agx_capture(seq, index, &hdr, buf + off);
+		}
 
 		switch (hdr.cmd_type) {
 		case DRM_ASAHI_CMD_COMPUTE:
@@ -920,13 +1037,41 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 			    cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base ||
 			    cmd.cdm_ctrl_stream_end - cmd.cdm_ctrl_stream_base < 4)
 				return (-EINVAL);
-			job->commands[job->n_commands++] = (struct agx_compute_range){
+			job->commands[job->n_commands++] = (struct agx_command){
 			    .start = cmd.cdm_ctrl_stream_base,
 			    .end = cmd.cdm_ctrl_stream_end,
 			};
 			break;
+		case DRM_ASAHI_CMD_RENDER:
+			if (job->n_commands >= AGX_MAX_COMMANDS ||
+			    hdr.size < offsetof(struct drm_asahi_cmd_render,
+			    bg_eot_rsrc_spec_hi))
+				return (-EINVAL);
+			memset(&render, 0, sizeof(render));
+			memcpy(&render, buf + off, min_t(u32, hdr.size,
+			    sizeof(render)));
+			job->commands[job->n_commands].render = true;
+			job->commands[job->n_commands].mesh_class = mesh_class;
+			ret = agx_parse_render(&render,
+			    &job->commands[job->n_commands].pass);
+			if (ret != 0) {
+				printf("agxdrm: render refused: %d\n", ret);
+				return (ret);
+			}
+			job->n_commands++;
+			break;
+		case DRM_ASAHI_SET_RENDER_RESOURCES_V2:
+			if ((ret = agx_parse_programs(buf + off, hdr.size,
+			    &mesh_class)) != 0) {
+				printf("agxdrm: render programs refused: %d\n",
+				    ret);
+				return (ret);
+			}
+			break;
 		case DRM_ASAHI_SET_COMPUTE_ATTACHMENTS:
-			/* Advisory only for the compute path. */
+		case DRM_ASAHI_SET_VERTEX_ATTACHMENTS:
+		case DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS:
+			/* Advisory: M5 kicks name no MCache table. */
 			break;
 		default:
 			return (-EOPNOTSUPP);
