@@ -6,7 +6,9 @@
  *
  * Each DRM file has a hardware address space and ordered compute queue.
  * Each live queue leases one of the firmware compute channels.
- * GEM objects are physically contiguous. Render commands are refused.
+ * GEM objects are physically contiguous. Render commands are refused: the
+ * render features are advertised so that userspace builds its M5 render
+ * submissions, which are logged (agx_capture) for the host reference.
  */
 
 #include <sys/param.h>
@@ -344,7 +346,9 @@ agx_ioctl_get_params(struct drm_device *drm, void *data, struct drm_file *file)
 		return (-EINVAL);
 	memset(&p, 0, sizeof(p));
 	p.features = DRM_ASAHI_FEATURE_VM_STATUS |
-	    DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES;
+	    DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES |
+	    DRM_ASAHI_FEATURE_RENDER_RESOURCES |
+	    DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2;
 	p.gpu_generation = agx->params.generation;
 	p.gpu_variant = agx->params.variant;
 	p.gpu_revision = agx->params.revision;
@@ -840,12 +844,59 @@ agx_run_job(struct work_struct *work)
 	mutex_unlock(&agx->lock);
 }
 
+/*
+ * Log one submission's render-side command, header and payload, as hex
+ * words for tools/agx_graph. Each line names the submission sequence, the
+ * command index and the payload offset.
+ */
+static void
+agx_capture(u_int seq, u_int index, const struct drm_asahi_cmd_header *hdr,
+    const u8 *payload)
+{
+	char line[8 * 9 + 1];
+	u32 off, word, i, n;
+
+	printf("agxdrm: render cap %u.%u type %u size %u vdm %u cdm %u\n", seq,
+	    index, hdr->cmd_type, hdr->size, hdr->vdm_barrier, hdr->cdm_barrier);
+	for (off = 0; off < hdr->size; off += 32) {
+		n = 0;
+		for (i = off; i < off + 32 && i < hdr->size; i += 4) {
+			word = 0;
+			memcpy(&word, payload + i, min_t(u32, 4, hdr->size - i));
+			n += snprintf(line + n, sizeof(line) - n, " %08x", word);
+		}
+		printf("agxdrm: render cap %u.%u +%04x:%s\n", seq, index, off,
+		    line);
+	}
+}
+
 static int
 agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 {
+	static u_int capture_seq;
 	struct drm_asahi_cmd_header hdr;
 	struct drm_asahi_cmd_compute cmd;
+	u_int index, seq = 0;
+	bool render = false;
 	u32 off;
+
+	for (off = 0, index = 0; off < size; off += hdr.size, index++) {
+		if (size - off < sizeof(hdr))
+			break;
+		memcpy(&hdr, buf + off, sizeof(hdr));
+		off += sizeof(hdr);
+		if (hdr.size > size - off)
+			break;
+		if (hdr.cmd_type == DRM_ASAHI_CMD_COMPUTE ||
+		    hdr.cmd_type == DRM_ASAHI_SET_COMPUTE_ATTACHMENTS)
+			continue;
+		if (!render)
+			seq = capture_seq++;
+		render = true;
+		agx_capture(seq, index, &hdr, buf + off);
+	}
+	if (render)
+		return (-EOPNOTSUPP);
 
 	for (off = 0; off < size; off += hdr.size) {
 		if (size - off < sizeof(hdr))
