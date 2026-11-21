@@ -269,6 +269,15 @@ appledrm_pdev_create(struct device_node *np, struct device *parent)
 		ap->own_child = bsddev;
 	}
 	bus_topo_unlock();
+	/*
+	 * A driverless newbus device has no name, and intr_event_add_handler() refuses a
+	 * handler named NULL (device_get_nameunit()): give it a devclass of its own.
+	 */
+	if (bsddev != NULL && device_get_name(bsddev) == NULL) {
+		bus_topo_lock();
+		device_set_devclass(bsddev, "appledrm_node");
+		bus_topo_unlock();
+	}
 	if (bsddev != NULL && device_get_desc(bsddev) == NULL)
 		device_set_desc_copy(bsddev, np->full_name);
 	pdev->dev.bsddev = bsddev;
