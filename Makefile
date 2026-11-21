@@ -3,7 +3,7 @@
 SYSDIR?=/usr/src/sys
 .include "${SYSDIR}/conf/kern.opts.mk"
 
-_VALID_KMODS=	dmabuf ttm drm dummygfx i915 amd radeon linuxkpi_video apple
+_VALID_KMODS=	dmabuf ttm drm dummygfx i915 amd radeon linuxkpi_video apple agx
 
 SUPPORTED_ARCH=	amd64 \
 		i386 \
@@ -27,7 +27,7 @@ DEFAULT_KMODS=	dmabuf		\
 DEFAULT_KMODS+=	i915
 .endif
 .if ${MACHINE_ARCH} == "aarch64"
-DEFAULT_KMODS+=	apple
+DEFAULT_KMODS+=	apple agx
 .endif
 
 .if defined(DUMMYGFX)
