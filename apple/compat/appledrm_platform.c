@@ -398,7 +398,8 @@ fail:
 			printf("appledrm: %s: %s probe failed: %d\n", pdev->dev.of_node->full_name, drv->driver.name, ret);
 	}
 	sx_xunlock(&appledrm_probe_sx);
-	if (ret == 0)
+	/* An on-demand provider can finish while its consumer is still probing. */
+	if (ret == 0 && !sx_xlocked(&appledrm_probe_sx))
 		appledrm_retry_deferred();
 	return (ret);
 }

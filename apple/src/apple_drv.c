@@ -2178,8 +2178,9 @@ static void __exit appledrm_unregister(void)
 	platform_driver_unregister(&apple_platform_driver);
 }
 
-module_init(appledrm_register);
-module_exit(appledrm_unregister);
+/* The DART and mailbox drivers register at SI_ORDER_FIRST. */
+module_init_order(appledrm_register, SI_ORDER_SECOND);
+module_exit_order(appledrm_unregister, SI_ORDER_THIRD);
 
 MODULE_AUTHOR("Asahi Linux contributors");
 MODULE_DESCRIPTION(DRIVER_DESC);
