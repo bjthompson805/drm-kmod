@@ -1,0 +1,29 @@
+--- a/soc/mailbox.c	2026-11-20 15:34:02.202925000 -0800
++++ b/soc/mailbox.c	2026-11-20 15:34:02.203970000 -0800
+@@ -918,6 +918,10 @@
+  */
+ static void apple_mbox_apply_rx_util_min(struct apple_mbox *mbox)
+ {
++#ifdef __FreeBSD__
++	/* FreeBSD: no uclamp; apple_mbox_set_rx_util_min() returns -EOPNOTSUPP. */
++	(void)mbox;
++#else
+ 	int util_min = READ_ONCE(mbox->rx_util_min);
+ 	struct sched_attr attr = {
+ 		.sched_policy = current->policy,
+@@ -931,13 +935,14 @@
+ 	attr.sched_util_min = util_min;
+ 	if (!sched_setattr_nocheck(current, &attr))
+ 		mbox->rx_util_min_applied = util_min;
++#endif
+ }
+ 
+ int apple_mbox_set_rx_util_min(struct apple_mbox *mbox, int util_min)
+ {
+ 	if (!IS_ENABLED(CONFIG_UCLAMP_TASK) || !apple_mbox_is_g17(mbox))
+ 		return -EOPNOTSUPP;
+-	if (util_min < -1 || util_min > SCHED_CAPACITY_SCALE)
++	if (util_min < -1 || util_min > 1024)
+ 		return -EINVAL;
+ 	WRITE_ONCE(mbox->rx_util_min, util_min);
+ 	return 0;
