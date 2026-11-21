@@ -361,15 +361,7 @@ appledrm_pdev_probe(struct platform_device *pdev)
 			goto fail;
 	}
 
-	{
-		extern int appledrm_errtrace_probing;
-
-		printf("appledrm: %s: %s probe start\n", pdev->dev.of_node->full_name,
-		    drv->driver.name);
-		atomic_add_int(&appledrm_errtrace_probing, 1);
-		ret = drv->probe(pdev);
-		atomic_subtract_int(&appledrm_errtrace_probing, 1);
-	}
+	ret = drv->probe(pdev);
 fail:
 	if (ret == 0) {
 		ap->bound = true;
@@ -380,7 +372,6 @@ fail:
 			ap->on_deferred = false;
 		}
 		mutex_unlock(&appledrm_plat_lock);
-		printf("appledrm: %s bound to %s\n", pdev->dev.of_node->full_name, drv->driver.name);
 	} else {
 		pdev->dev.driver = NULL;
 		lkpi_devres_release_free_list(&pdev->dev);

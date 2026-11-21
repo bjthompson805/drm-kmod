@@ -65,16 +65,3 @@ CFLAGS+= -DDRM_SYSCTL_PARAM_PREFIX=_dri
 CWARNFLAGS += -Wno-macro-redefined -Wno-unused-label
 CFLAGS+= -ferror-limit=0
 CFLAGS.drm_gem_fb_extra.c+= -I${.CURDIR:H}/drivers/gpu/drm
-CFLAGS.apple-dart.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.io-pgtable-dart.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.mailbox.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.rtkit.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.dcp.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.apple_drv.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.afk.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.iomfb.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.iomfb_v27.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.appledrm_of.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.appledrm_platform.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.appledrm_iommu.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h
-CFLAGS.appledrm_misc.c+= -include ${.CURDIR}/compat/appledrm_errtrace.h

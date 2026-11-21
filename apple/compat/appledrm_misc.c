@@ -392,7 +392,6 @@ appledrm_memremap(resource_size_t offset, size_t size, unsigned long flags)
 	 */
 	if (PHYS_IN_DMAP(offset) && PHYS_IN_DMAP(offset + size - 1)) {
 		va = (void *)PHYS_TO_DMAP(offset);
-		printf("appledrm: memremap pa %#jx size %#zx: DMAP -> %p\n", (uintmax_t)offset, size, va);
 		return (va);
 	}
 	e = kzalloc(sizeof(*e), GFP_KERNEL);
@@ -404,7 +403,6 @@ appledrm_memremap(resource_size_t offset, size_t size, unsigned long flags)
 		kfree(e);
 		return (NULL);
 	}
-	printf("appledrm: memremap pa %#jx size %#zx: mapdev -> %p\n", (uintmax_t)offset, size, va);
 	e->va = va;
 	e->size = size;
 	spin_lock(&memremap_lock);
@@ -530,38 +528,4 @@ int
 param_get_int(char *buffer, const struct kernel_param *kp)
 {
 	return (snprintf(buffer, 4096, "%d\n", *(int *)kp->arg));
-}
-
-/* ---- appledrm_errtrace.h ---- */
-
-#define	ERRTRACE_SLOTS	512
-static struct { const char *file; int line; } errtrace_seen[ERRTRACE_SLOTS];
-static int errtrace_n;
-static struct mtx errtrace_mtx;
-MTX_SYSINIT(appledrm_errtrace, &errtrace_mtx, "appledrm errtrace", MTX_SPIN);
-
-int appledrm_errtrace_probing;	/* appledrm_platform.c: inside a probe, log every hit */
-
-int
-appledrm_errtrace(const char *file, int line, const char *name, int val)
-{
-	const char *base = strrchr(file, '/');
-	bool seen = false;
-	int i;
-
-	mtx_lock_spin(&errtrace_mtx);
-	for (i = 0; i < errtrace_n; i++)
-		if (errtrace_seen[i].file == file && errtrace_seen[i].line == line) {
-			seen = true;
-			break;
-		}
-	if (!seen && errtrace_n < ERRTRACE_SLOTS) {
-		errtrace_seen[errtrace_n].file = file;
-		errtrace_seen[errtrace_n].line = line;
-		errtrace_n++;
-	}
-	mtx_unlock_spin(&errtrace_mtx);
-	if (!seen || appledrm_errtrace_probing > 0)
-		printf("appledrm: %s at %s:%d\n", name, base != NULL ? base + 1 : file, line);
-	return (val);
 }
