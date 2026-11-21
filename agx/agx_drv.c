@@ -6,7 +6,7 @@
  *
  * Each DRM file has a hardware address space and ordered compute queue.
  * Each live queue leases one of the firmware compute channels.
- * GEM objects are physically contiguous. Render commands run on the GPU's
+ * GEM objects are arrays of pages. Render commands run on the GPU's
  * one render pair; the first few are also logged (agx_capture) for the
  * host reference tools.
  */
@@ -79,12 +79,20 @@ struct agx_drm {
 	bool			gpu_failed;
 };
 
+/* Pages are allocated one at a time: large contiguous runs are not available. */
 struct agx_bo {
 	struct drm_gem_object	base;
-	struct page		*pages;
-	vm_paddr_t		pa;
+	struct page		**pages;
+	size_t			npages;
 	size_t			size;
 };
+
+static vm_paddr_t
+agx_bo_pa(const struct agx_bo *bo, size_t off)
+{
+
+	return (page_to_phys(bo->pages[off / AGX_PAGE]) + off % AGX_PAGE);
+}
 
 struct agx_binding {
 	struct list_head	link;
@@ -221,10 +229,15 @@ static void
 agx_bo_free(struct drm_gem_object *obj)
 {
 	struct agx_bo *bo = to_bo(obj);
+	size_t i;
 
 	drm_gem_object_release(obj);
-	if (bo->pages != NULL)
-		__free_pages(bo->pages, get_order(bo->size));
+	if (bo->pages != NULL) {
+		for (i = 0; i < bo->npages; i++)
+			if (bo->pages[i] != NULL)
+				__free_page(bo->pages[i]);
+		kvfree(bo->pages);
+	}
 	kfree(bo);
 }
 
@@ -242,7 +255,7 @@ agx_bo_fault(struct vm_fault *vmf)
 	if (off >= bo->size)
 		return (VM_FAULT_SIGBUS);
 	return (lkpi_vmf_insert_pfn_prot_locked(vma, vmf->address,
-	    (bo->pa + off) >> PAGE_SHIFT, vma->vm_page_prot));
+	    agx_bo_pa(bo, off) >> PAGE_SHIFT, vma->vm_page_prot));
 }
 
 static int
@@ -270,10 +283,23 @@ static const struct drm_gem_object_funcs agx_bo_funcs = {
 	.vm_ops = &agx_bo_vm_ops,
 };
 
+static void
+agx_bo_release_pages(struct agx_bo *bo)
+{
+	size_t i;
+
+	for (i = 0; i < bo->npages; i++)
+		if (bo->pages[i] != NULL)
+			__free_page(bo->pages[i]);
+	kvfree(bo->pages);
+	kfree(bo);
+}
+
 static struct agx_bo *
 agx_bo_create(struct drm_device *drm, size_t size)
 {
 	struct agx_bo *bo;
+	size_t i;
 
 	size = roundup(size, AGX_PAGE);
 	if (size == 0)
@@ -282,14 +308,22 @@ agx_bo_create(struct drm_device *drm, size_t size)
 	if (bo == NULL)
 		return (ERR_PTR(-ENOMEM));
 	bo->size = size;
-	bo->pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, get_order(size));
+	bo->npages = size / AGX_PAGE;
+	bo->pages = kvcalloc(bo->npages, sizeof(*bo->pages), GFP_KERNEL);
 	if (bo->pages == NULL) {
 		kfree(bo);
 		return (ERR_PTR(-ENOMEM));
 	}
-	bo->pa = page_to_phys(bo->pages);
-	/* The GPU maps it uncached; push the zeroes out of the caches. */
-	cpu_dcache_wbinv_range((void *)PHYS_TO_DMAP(bo->pa), size);
+	for (i = 0; i < bo->npages; i++) {
+		bo->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (bo->pages[i] == NULL) {
+			agx_bo_release_pages(bo);
+			return (ERR_PTR(-ENOMEM));
+		}
+		/* The GPU maps it uncached; push the zeroes out of the caches. */
+		cpu_dcache_wbinv_range(
+		    (void *)PHYS_TO_DMAP(page_to_phys(bo->pages[i])), AGX_PAGE);
+	}
 	bo->base.funcs = &agx_bo_funcs;
 	drm_gem_private_object_init(drm, &bo->base, size);
 	return (bo);
@@ -534,6 +568,29 @@ agx_remove_interval(struct agx_drm *agx, struct agx_vm *vm, uint64_t start,
 	return (0);
 }
 
+/* Map range bytes of bo from offset at va, one page at a time. */
+static int
+agx_map_pages(struct agx_drm *agx, struct agx_vm *vm, uint64_t va,
+    struct agx_bo *bo, uint64_t offset, uint64_t range, u_int flags)
+{
+	uint64_t off;
+	int ret;
+
+	if ((flags & APPLE_AGX_VM_SINGLE) != 0)
+		return (-apple_agx_vm_map(agx->gpu, vm->context, va,
+		    agx_bo_pa(bo, offset), range, flags));
+	for (off = 0; off < range; off += AGX_PAGE) {
+		ret = -apple_agx_vm_map(agx->gpu, vm->context, va + off,
+		    agx_bo_pa(bo, offset + off), AGX_PAGE, flags);
+		if (ret != 0) {
+			if (off != 0)
+				apple_agx_vm_unmap(agx->gpu, vm->context, va, off);
+			return (ret);
+		}
+	}
+	return (0);
+}
+
 static int
 agx_bind_op(struct agx_drm *agx, struct agx_vm *vm, struct drm_file *file,
     const struct drm_asahi_gem_bind_op *op)
@@ -591,8 +648,8 @@ agx_bind_op(struct agx_drm *agx, struct agx_vm *vm, struct drm_file *file,
 		kfree(binding);
 		goto out;
 	}
-	ret = -apple_agx_vm_map(agx->gpu, vm->context, op->addr,
-	    bo->pa + op->offset, op->range, flags);
+	ret = agx_map_pages(agx, vm, op->addr, bo, op->offset, op->range,
+	    flags);
 	if (ret != 0) {
 		kfree(split);
 		kfree(binding);
@@ -724,12 +781,15 @@ agx_ioctl_queue_destroy(struct drm_device *drm, void *data,
 	return (0);
 }
 
+#define	AGX_MAX_PROGRAMS	16	/* linked render programs per render */
+
 struct agx_command {
 	bool			 render;
 	u64			 start;		/* compute: the CDM stream */
 	u64			 end;
-	uint8_t			 mesh_class;	/* render */
-	struct agx_render_pass	 pass;
+	struct agx_render_pass	 pass;		/* render */
+	u_int			 nprograms;
+	struct agx_render_program programs[AGX_MAX_PROGRAMS];
 };
 
 struct agx_job {
@@ -827,8 +887,8 @@ agx_run_job(struct work_struct *work)
 	for (i = 0; i < job->n_commands && ret == 0; i++) {
 		if (job->commands[i].render)
 			ret = -apple_agx_submit_render(agx->gpu, vm->context,
-			    &job->commands[i].pass, job->commands[i].mesh_class,
-			    0);
+			    &job->commands[i].pass, job->commands[i].programs,
+			    job->commands[i].nprograms, 0);
 		else
 			ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
 			    vm->context, job->commands[i].start,
@@ -971,25 +1031,40 @@ agx_parse_render(const struct drm_asahi_cmd_render *c, struct agx_render_pass *p
 }
 
 /*
- * render_resources.rs parse_v2, as far as this driver runs renders: the
- * mesh class. SCS (ray-query scratch) and mesh programs are not run yet.
+ * render_resources.rs parse_v2, for the programs this driver runs: SCS
+ * (ray-query scratch) and mesh/object programs are refused for now.
  */
 static int
-agx_parse_programs(const u8 *b, u32 size, uint8_t *mesh_class)
+agx_parse_programs(const u8 *b, u32 size, struct agx_render_program *out,
+    u_int *n)
 {
 	struct drm_asahi_render_program_v2 e;
 	u32 off;
 
 	if (size == 0 || size % sizeof(e) != 0)
 		return (-EINVAL);
-	*mesh_class = 0;
+	if (size / sizeof(e) > AGX_MAX_PROGRAMS)
+		return (-EOPNOTSUPP);
+	*n = 0;
 	for (off = 0; off < size; off += sizeof(e)) {
 		memcpy(&e, b + off, sizeof(e));
-		if (e.reserved != 0 || e.legacy.flags != 0 || e.legacy.stage > 1)
+		if (e.reserved != 0 || e.legacy.flags != 0 || e.legacy.stage > 1 ||
+		    (e.usage_flags & ~0xfu) != 0 || e.threads != 0)
 			return (-EINVAL);
 		if (e.scs_layout != 0 || e.intersection_pool != 0 ||
-		    (e.usage_flags & ~0u) != 0)
+		    e.usage_flags != 0 || e.auxiliary_allocation != 0)
 			return (-EOPNOTSUPP);
+		out[(*n)++] = (struct agx_render_program){
+		    .stage = e.legacy.stage,
+		    .primary_bytes = e.legacy.primary_bytes,
+		    .secondary_bytes = e.legacy.secondary_bytes,
+		    .linked_bytes = e.legacy.linked_bytes,
+		    .minimum_primary_bytes = e.legacy.minimum_primary_bytes,
+		    .auxiliary_count = e.legacy.auxiliary_count,
+		    .threadgroup_bytes = e.legacy.threadgroup_bytes,
+		    .imageblock_bytes = e.legacy.imageblock_bytes,
+		    .multisample_bytes = e.legacy.multisample_bytes,
+		};
 	}
 	return (0);
 }
@@ -1001,8 +1076,8 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 	struct drm_asahi_cmd_header hdr;
 	struct drm_asahi_cmd_compute cmd;
 	struct drm_asahi_cmd_render render;
-	uint8_t mesh_class = 0;
-	u_int index, seq = 0;
+	struct agx_render_program programs[AGX_MAX_PROGRAMS];
+	u_int nprograms = 0, index, seq = 0;
 	bool captured = false;
 	u32 off;
 	int ret;
@@ -1050,8 +1125,13 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 			memset(&render, 0, sizeof(render));
 			memcpy(&render, buf + off, min_t(u32, hdr.size,
 			    sizeof(render)));
+			/* M5 renders carry their linked programs. */
+			if (nprograms == 0)
+				return (-EINVAL);
 			job->commands[job->n_commands].render = true;
-			job->commands[job->n_commands].mesh_class = mesh_class;
+			job->commands[job->n_commands].nprograms = nprograms;
+			memcpy(job->commands[job->n_commands].programs, programs,
+			    nprograms * sizeof(programs[0]));
 			ret = agx_parse_render(&render,
 			    &job->commands[job->n_commands].pass);
 			if (ret != 0) {
@@ -1062,7 +1142,7 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 			break;
 		case DRM_ASAHI_SET_RENDER_RESOURCES_V2:
 			if ((ret = agx_parse_programs(buf + off, hdr.size,
-			    &mesh_class)) != 0) {
+			    programs, &nprograms)) != 0) {
 				printf("agxdrm: render programs refused: %d\n",
 				    ret);
 				return (ret);
