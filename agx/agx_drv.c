@@ -1086,13 +1086,15 @@ agx_parse_render(const struct drm_asahi_cmd_render *c, struct agx_render_pass *p
 
 /*
  * render_resources.rs parse_v2, for the programs this driver runs: SCS
- * (ray-query scratch) and mesh/object programs are refused for now.
+ * (ray-query scratch) and API task programs are refused for now. Mesh
+ * and object programs run on the tiling engine with their thread count.
  */
 static int
 agx_parse_programs(const u8 *b, u32 size, struct agx_render_program *out,
     u_int *n)
 {
 	struct drm_asahi_render_program_v2 e;
+	bool mesh;
 	u32 off;
 
 	if (size == 0 || size % sizeof(e) != 0)
@@ -1102,11 +1104,22 @@ agx_parse_programs(const u8 *b, u32 size, struct agx_render_program *out,
 	*n = 0;
 	for (off = 0; off < size; off += sizeof(e)) {
 		memcpy(&e, b + off, sizeof(e));
+		mesh = (e.usage_flags & (DRM_ASAHI_RENDER_PROGRAM_MESH |
+		    DRM_ASAHI_RENDER_PROGRAM_OBJECT)) != 0;
 		if (e.reserved != 0 || e.legacy.flags != 0 || e.legacy.stage > 1 ||
-		    (e.usage_flags & ~0xfu) != 0 || e.threads != 0)
+		    (e.usage_flags & ~0xfu) != 0 ||
+		    (e.usage_flags & 6) == 6 || (mesh != (e.threads != 0)) ||
+		    ((e.usage_flags & DRM_ASAHI_RENDER_PROGRAM_TASK) != 0 &&
+		    (e.usage_flags & DRM_ASAHI_RENDER_PROGRAM_OBJECT) == 0) ||
+		    (mesh && (e.legacy.stage != 0 ||
+		    e.legacy.auxiliary_count != 0 ||
+		    e.legacy.imageblock_bytes != 0 ||
+		    e.legacy.multisample_bytes != 0)))
 			return (-EINVAL);
 		if (e.scs_layout != 0 || e.intersection_pool != 0 ||
-		    e.usage_flags != 0 || e.auxiliary_allocation != 0)
+		    (e.usage_flags & (DRM_ASAHI_RENDER_PROGRAM_SCS |
+		    DRM_ASAHI_RENDER_PROGRAM_TASK)) != 0 ||
+		    e.auxiliary_allocation != 0)
 			return (-EOPNOTSUPP);
 		out[(*n)++] = (struct agx_render_program){
 		    .stage = e.legacy.stage,
@@ -1118,6 +1131,7 @@ agx_parse_programs(const u8 *b, u32 size, struct agx_render_program *out,
 		    .threadgroup_bytes = e.legacy.threadgroup_bytes,
 		    .imageblock_bytes = e.legacy.imageblock_bytes,
 		    .multisample_bytes = e.legacy.multisample_bytes,
+		    .threads = e.threads,
 		};
 	}
 	return (0);
