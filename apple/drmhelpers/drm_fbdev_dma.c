@@ -61,6 +61,37 @@ static void drm_fbdev_dma_fb_destroy(struct fb_info *info)
 	kfree(fb_helper);
 }
 
+#ifdef __FreeBSD__
+/* vt's RGB palette leaves the alpha byte clear. DCP blends that byte. */
+static u32
+appledrm_fbdev_opaque_alpha(const struct fb_info *info)
+{
+	if (info->var.transp.offset == 24 && info->var.transp.length == 8)
+		return (0xff000000);
+	return (0);
+}
+
+static void
+appledrm_fbdev_fillrect(struct fb_info *info, const struct fb_fillrect *rect)
+{
+	struct fb_fillrect opaque = *rect;
+
+	opaque.color |= appledrm_fbdev_opaque_alpha(info);
+	sys_fillrect(info, &opaque);
+}
+
+static void
+appledrm_fbdev_imageblit(struct fb_info *info, const struct fb_image *image)
+{
+	struct fb_image opaque = *image;
+	u32 alpha = appledrm_fbdev_opaque_alpha(info);
+
+	opaque.fg_color |= alpha;
+	opaque.bg_color |= alpha;
+	sys_imageblit(info, &opaque);
+}
+#endif
+
 static const struct fb_ops drm_fbdev_dma_fb_ops = {
 	.owner = THIS_MODULE,
 	.fb_open = drm_fbdev_dma_fb_open,
@@ -72,6 +103,9 @@ static const struct fb_ops drm_fbdev_dma_fb_ops = {
 #ifdef __linux__
 	__FB_DEFAULT_DMAMEM_OPS_DRAW,
 	.fb_mmap = drm_fbdev_dma_fb_mmap,
+#else
+	.fb_fillrect = appledrm_fbdev_fillrect,
+	.fb_imageblit = appledrm_fbdev_imageblit,
 #endif
 	.fb_destroy = drm_fbdev_dma_fb_destroy,
 };
