@@ -128,9 +128,19 @@ drm_dev_alias(struct device *ldev, struct drm_minor *minor, const char *minor_st
 	device_t dev = ldev->parent->bsddev;
 	char buf[32];
 	u32 tmp;
+	int error;
 
 	MPASS(dev != NULL);
-	ctx_list = device_get_sysctl_ctx(dev);
+	/*
+	 * The minor owns its sysctl nodes and its dri/ alias, so that a
+	 * DRM device freed after a failed probe leaves its index reusable
+	 * (drm_dev_alias_release).
+	 */
+	ctx_list = kzalloc(sizeof(*ctx_list), GFP_KERNEL);
+	if (ctx_list == NULL)
+		return (-ENOMEM);
+	sysctl_ctx_init(ctx_list);
+	minor->bsd_sysctl = ctx_list;
 	snprintf(buf, sizeof(buf), "%d", minor->index);
 	node = SYSCTL_ADD_NODE(ctx_list, SYSCTL_STATIC_CHILDREN(_dev_drm), OID_AUTO, buf,
 	    CTLFLAG_RD, NULL, "DRM properties");
@@ -154,9 +164,28 @@ drm_dev_alias(struct device *ldev, struct drm_minor *minor, const char *minor_st
 	if (cdevp == NULL)
 		return (-ENXIO);
 	minor->bsd_device = cdevp->cdev;
-	make_dev_alias(cdevp->cdev, buf, minor->index);
+	error = make_dev_alias_p(MAKEDEV_WAITOK | MAKEDEV_CHECKNAME,
+	    &minor->bsd_alias, cdevp->cdev, buf, minor->index);
+	if (error != 0)
+		return (-error);
 	reset_debug_log();
 	return (0);
+}
+
+/* Undo drm_dev_alias, from drm_minor_alloc_release. */
+void
+drm_dev_alias_release(struct drm_minor *minor)
+{
+
+	if (minor->bsd_alias != NULL) {
+		destroy_dev(minor->bsd_alias);
+		minor->bsd_alias = NULL;
+	}
+	if (minor->bsd_sysctl != NULL) {
+		sysctl_ctx_free(minor->bsd_sysctl);
+		kfree(minor->bsd_sysctl);
+		minor->bsd_sysctl = NULL;
+	}
 }
 
 static int
