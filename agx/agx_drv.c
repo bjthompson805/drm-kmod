@@ -39,7 +39,9 @@
 #include <arm64/apple/apple_agx_api.h>
 #include <arm64/apple/apple_agx_render.h>
 
-#define	AGX_PAGE		0x4000ul	/* UAT page = kernel page */
+#define	AGX_PAGE		0x4000ul	/* UAT page */
+/* Each UAT page is one aligned block of kernel pages. */
+#define	AGX_PAGE_ORDER		(ilog2(AGX_PAGE) - PAGE_SHIFT)
 #define	AGX_MAX_COMMANDS	64
 #define	AGX_MAX_SYNCS		256
 #define	AGX_MAX_PENDING	64
@@ -237,7 +239,7 @@ agx_bo_free(struct drm_gem_object *obj)
 	if (bo->pages != NULL) {
 		for (i = 0; i < bo->npages; i++)
 			if (bo->pages[i] != NULL)
-				__free_page(bo->pages[i]);
+				__free_pages(bo->pages[i], AGX_PAGE_ORDER);
 		kvfree(bo->pages);
 	}
 	kfree(bo);
@@ -292,7 +294,7 @@ agx_bo_release_pages(struct agx_bo *bo)
 
 	for (i = 0; i < bo->npages; i++)
 		if (bo->pages[i] != NULL)
-			__free_page(bo->pages[i]);
+			__free_pages(bo->pages[i], AGX_PAGE_ORDER);
 	kvfree(bo->pages);
 	kfree(bo);
 }
@@ -317,7 +319,8 @@ agx_bo_create(struct drm_device *drm, size_t size)
 		return (ERR_PTR(-ENOMEM));
 	}
 	for (i = 0; i < bo->npages; i++) {
-		bo->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		bo->pages[i] = alloc_pages(GFP_KERNEL | __GFP_ZERO,
+		    AGX_PAGE_ORDER);
 		if (bo->pages[i] == NULL) {
 			agx_bo_release_pages(bo);
 			return (ERR_PTR(-ENOMEM));
