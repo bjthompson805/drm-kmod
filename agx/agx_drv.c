@@ -385,7 +385,8 @@ agx_ioctl_get_params(struct drm_device *drm, void *data, struct drm_file *file)
 	p.features = DRM_ASAHI_FEATURE_VM_STATUS |
 	    DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES |
 	    DRM_ASAHI_FEATURE_RENDER_RESOURCES |
-	    DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2;
+	    DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2 |
+	    DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
 	p.gpu_generation = agx->params.generation;
 	p.gpu_variant = agx->params.variant;
 	p.gpu_revision = agx->params.revision;
@@ -1086,8 +1087,8 @@ agx_parse_render(const struct drm_asahi_cmd_render *c, struct agx_render_pass *p
 
 /*
  * render_resources.rs parse_v2, for the programs this driver runs: SCS
- * (ray-query scratch) and API task programs are refused for now. Mesh
- * and object programs run on the tiling engine with their thread count.
+ * (ray-query scratch) is refused for now. Mesh, object and API task
+ * programs run on the tiling engine with their thread count.
  */
 static int
 agx_parse_programs(const u8 *b, u32 size, struct agx_render_program *out,
@@ -1117,8 +1118,7 @@ agx_parse_programs(const u8 *b, u32 size, struct agx_render_program *out,
 		    e.legacy.multisample_bytes != 0)))
 			return (-EINVAL);
 		if (e.scs_layout != 0 || e.intersection_pool != 0 ||
-		    (e.usage_flags & (DRM_ASAHI_RENDER_PROGRAM_SCS |
-		    DRM_ASAHI_RENDER_PROGRAM_TASK)) != 0 ||
+		    (e.usage_flags & DRM_ASAHI_RENDER_PROGRAM_SCS) != 0 ||
 		    e.auxiliary_allocation != 0)
 			return (-EOPNOTSUPP);
 		out[(*n)++] = (struct agx_render_program){
@@ -1132,6 +1132,7 @@ agx_parse_programs(const u8 *b, u32 size, struct agx_render_program *out,
 		    .imageblock_bytes = e.legacy.imageblock_bytes,
 		    .multisample_bytes = e.legacy.multisample_bytes,
 		    .threads = e.threads,
+		    .task = (e.usage_flags & DRM_ASAHI_RENDER_PROGRAM_TASK) != 0,
 		};
 	}
 	return (0);
