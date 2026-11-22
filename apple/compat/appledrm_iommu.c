@@ -984,6 +984,16 @@ dma_map_phys(struct device *dev, vm_paddr_t pa, size_t *sizep, bool mmio)
 	return (iova);
 }
 
+/* The mapping unit for @dev: its DMA domain's granule, else the kernel page. */
+static size_t
+dma_granule(struct device *dev)
+{
+	struct iommu_domain *d;
+	struct appledrm_dma_cookie *c = dev_dma_cookie(dev, &d);
+
+	return (c != NULL ? MAX(c->granule, PAGE_SIZE) : PAGE_SIZE);
+}
+
 static void
 dma_unmap_iova(struct device *dev, dma_addr_t iova, size_t size)
 {
@@ -1039,17 +1049,11 @@ appledrm_dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *handle, gf
 	vm_paddr_t pa;
 	dma_addr_t iova;
 
-	asize = roundup(size, PAGE_SIZE);
-	{
-		struct iommu_domain *d;
-		struct appledrm_dma_cookie *c = dev_dma_cookie(dev, &d);
-
-		if (c != NULL)
-			asize = roundup(size, c->granule);
-	}
+	/* Whole, aligned granules: a DART page may be larger than the kernel's. */
+	asize = roundup(size, dma_granule(dev));
 	ma = appledrm_dev_is_dma_coherent(dev) ? VM_MEMATTR_DEFAULT : VM_MEMATTR_WRITE_COMBINING;
 	cpu = kmem_alloc_contig(asize, M_ZERO | ((gfp & M_NOWAIT) ? M_NOWAIT : M_WAITOK), 0,
-	    ~(vm_paddr_t)0, PAGE_SIZE, 0, ma);
+	    ~(vm_paddr_t)0, dma_granule(dev), 0, ma);
 	if (cpu == NULL) {
 		dev_err(dev, "DMA backing allocation failed: size %#zx\n", asize);
 		return (NULL);
@@ -1101,8 +1105,9 @@ dma_addr_t
 appledrm_dma_map_resource(struct device *dev, phys_addr_t phys, size_t size,
     enum dma_data_direction dir, unsigned long attrs)
 {
-	vm_paddr_t pa = trunc_page(phys);
-	size_t msize = round_page(phys + size) - pa;
+	size_t g = dma_granule(dev);
+	vm_paddr_t pa = rounddown2(phys, g);
+	size_t msize = roundup2(phys + size, g) - pa;
 	dma_addr_t iova = dma_map_phys(dev, pa, &msize, true);
 
 	if (iova == DMA_MAPPING_ERROR)
@@ -1126,8 +1131,13 @@ appledrm_dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size,
 dma_addr_t
 appledrm_dma_map_single(struct device *dev, void *ptr, size_t size, enum dma_data_direction dir)
 {
-	vm_paddr_t phys = vtophys(ptr), pa = trunc_page(phys);
-	size_t msize = round_page(phys + size) - pa;
+	/*
+	 * Whole granules around the buffer: with a DART page larger than the
+	 * kernel's, the device also reaches the rest of those DART pages.
+	 */
+	size_t g = dma_granule(dev);
+	vm_paddr_t phys = vtophys(ptr), pa = rounddown2(phys, g);
+	size_t msize = roundup2(phys + size, g) - pa;
 	dma_addr_t iova;
 
 	if (!appledrm_dev_is_dma_coherent(dev))

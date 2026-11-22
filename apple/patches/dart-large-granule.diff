@@ -1,0 +1,96 @@
+--- a/iommu/apple-dart.c
++++ b/iommu/apple-dart.c
+@@ -3250,8 +3250,6 @@
+ 	int ret = 0;
+ 	int i, j;
+ 
+-	if (dart->pgsize > PAGE_SIZE)
+-		return -EINVAL;
+ 	if (check_add_overflow((u64)dma_max, (u64)dart->dma_offset,
+ 			       &translated_max))
+ 		return -ERANGE;
+@@ -4111,7 +4109,7 @@
+ 	struct apple_dart_dcp_allocation *allocation;
+ 	struct apple_dart_domain *dd;
+ 	struct apple_dart_dcp *dcp;
+-	unsigned int root, count, allocated = 0;
++	unsigned int root, count, order, allocated = 0;
+ 	bool coherent = dev_is_dma_coherent(dev);
+ 	int prot = IOMMU_READ | IOMMU_WRITE | (coherent ? IOMMU_CACHE : 0);
+ 	int ret = apple_dart_dcp_check(dev);
+@@ -4121,10 +4119,12 @@
+ 		return ERR_PTR(ret);
+ 	if (!size || size > SZ_16M)
+ 		return ERR_PTR(-EINVAL);
+-	size = PAGE_ALIGN(size);
+-	count = size >> PAGE_SHIFT;
+ 	dd = to_dart_domain(iommu_get_domain_for_dev(dev));
+ 	dcp = dd->dcp;
++	/* Whole DART pages, each one aligned block of kernel pages. */
++	order = ilog2(max_t(size_t, dcp->dart->pgsize, PAGE_SIZE)) - PAGE_SHIFT;
++	size = ALIGN(size, PAGE_SIZE << order);
++	count = size >> PAGE_SHIFT;
+ 	mutex_lock(&dcp->alloc_lock);
+ 	if (dcp->sid != 23) {
+ 		result = ERR_PTR(-ENODEV);
+@@ -4151,12 +4151,15 @@
+ 	}
+ 	allocation->size = size;
+ 	allocation->dva = DCP_DART_ALIAS + root * DCP_DART_SLICE;
+-	for (allocated = 0; allocated < count; allocated++) {
+-		allocation->pages[allocated] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+-		if (!allocation->pages[allocated])
++	for (allocated = 0; allocated < count; allocated += 1u << order) {
++		struct page *block = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
++
++		if (!block)
+ 			goto free_unpublished;
++		for (unsigned int j = 0; j < 1u << order; j++)
++			allocation->pages[allocated + j] = block + j;
+ 		if (!coherent)
+-			arch_dma_prep_coherent(allocation->pages[allocated], PAGE_SIZE);
++			arch_dma_prep_coherent(block, PAGE_SIZE << order);
+ 	}
+ 	allocation->cpu = dma_common_pages_remap(allocation->pages, size,
+ 						 dma_pgprot(dev, PAGE_KERNEL, 0),
+@@ -4166,9 +4169,10 @@
+ 	/* Own payload pages BEFORE the first PTE, including every rollback case. */
+ 	list_add_tail(&allocation->link, &dcp->allocations);
+ 	dcp->allocated += size;
+-	for (unsigned int i = 0; i < count; i++) {
++	for (unsigned int i = 0; i < count; i += 1u << order) {
+ 		ret = iommu_map(&dd->domain, allocation->dva + i * PAGE_SIZE,
+-				page_to_phys(allocation->pages[i]), PAGE_SIZE, prot, GFP_KERNEL);
++				page_to_phys(allocation->pages[i]), PAGE_SIZE << order,
++				prot, GFP_KERNEL);
+ 		if (ret)
+ 			goto pin_failure;
+ 	}
+@@ -4192,8 +4196,10 @@
+ 	goto unlock;
+ free_unpublished:
+ 	/* Safe only because no page address or PTE has been exposed yet. */
+-	while (allocated)
+-		__free_page(allocation->pages[--allocated]);
++	while (allocated) {
++		allocated -= 1u << order;
++		__free_pages(allocation->pages[allocated], order);
++	}
+ 	kfree(allocation);
+ 	result = ERR_PTR(-ENOMEM);
+ unlock:
+@@ -4426,7 +4432,13 @@
+ 	if (cfg->stream_maps[0].dart->retained_mtp ||
+ 	    cfg->stream_maps[0].dart->live_mtp)
+ 		return IOMMU_DOMAIN_IDENTITY;
+-	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE)
++	/*
++	 * A DART page larger than the kernel's bypasses where it can. One that
++	 * cannot (DCP, or any locked DART) translates whole DART pages: the DMA
++	 * layer maps them.
++	 */
++	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE && cfg->supports_bypass &&
++	    !cfg->locked)
+ 		return IOMMU_DOMAIN_IDENTITY;
+ 	/*
+ 	 * Tunneled PCIe is untrusted, and the PCIe-C DART bypasses only its
