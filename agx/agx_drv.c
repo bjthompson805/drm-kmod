@@ -443,7 +443,8 @@ agx_ioctl_get_params(struct drm_device *drm, void *data, struct drm_file *file)
 	    DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES |
 	    DRM_ASAHI_FEATURE_RENDER_RESOURCES |
 	    DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2 |
-	    DRM_ASAHI_FEATURE_TASK_MESH_STORAGE;
+	    DRM_ASAHI_FEATURE_TASK_MESH_STORAGE |
+	    DRM_ASAHI_FEATURE_COMPUTE_RESOURCES;
 	p.gpu_generation = agx->params.generation;
 	p.gpu_variant = agx->params.variant;
 	p.gpu_revision = agx->params.revision;
@@ -1078,7 +1079,8 @@ agx_run_job(struct work_struct *work)
 			    &c->pass, c->programs, c->nprograms, 0);
 		else
 			ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
-			    vm->context, c->start, c->end, 0);
+			    vm->context, c->start, c->end, c->programs,
+			    c->nprograms, 0);
 		gpu_failed = ret != 0 && ret != -EINVAL && ret != -E2BIG &&
 		    ret != -EOPNOTSUPP;
 		if (ret == 0)
@@ -1294,6 +1296,38 @@ agx_parse_programs(const u8 *b, u32 size, struct agx_render_program *out,
 }
 
 /*
+ * render_resources.rs ComputePrograms::parse: the storage of each distinct
+ * dispatch in the following compute commands. An empty list clears it.
+ */
+static int
+agx_parse_dispatches(const u8 *b, u32 size, struct agx_render_program *out,
+    u_int *n)
+{
+	struct drm_asahi_compute_program e;
+	u32 off;
+
+	if (size % sizeof(e) != 0)
+		return (-EINVAL);
+	if (size / sizeof(e) > AGX_MAX_PROGRAMS)
+		return (-EOPNOTSUPP);
+	*n = 0;
+	for (off = 0; off < size; off += sizeof(e)) {
+		memcpy(&e, b + off, sizeof(e));
+		if (e.flags != 0 || e.threads == 0)
+			return (-EINVAL);
+		out[(*n)++] = (struct agx_render_program){
+		    .primary_bytes = e.primary_bytes,
+		    .secondary_bytes = e.secondary_bytes,
+		    .linked_bytes = e.linked_bytes,
+		    .minimum_primary_bytes = e.minimum_primary_bytes,
+		    .threadgroup_bytes = e.threadgroup_bytes,
+		    .threads = e.threads,
+		};
+	}
+	return (0);
+}
+
+/*
  * Resolve one drm_asahi_timestamp of a parsed command (already counted in
  * job->n_commands, so agx_job_free releases what this takes).
  */
@@ -1352,7 +1386,8 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 	struct drm_asahi_cmd_compute cmd;
 	struct drm_asahi_cmd_render render;
 	struct agx_render_program programs[AGX_MAX_PROGRAMS];
-	u_int nprograms = 0, index, seq = 0;
+	struct agx_render_program dispatches[AGX_MAX_PROGRAMS];
+	u_int nprograms = 0, ndispatches = 0, index, seq = 0;
 	bool captured = false;
 	u32 off;
 	int ret;
@@ -1390,7 +1425,10 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 			job->commands[job->n_commands++] = (struct agx_command){
 			    .start = cmd.cdm_ctrl_stream_base,
 			    .end = cmd.cdm_ctrl_stream_end,
+			    .nprograms = ndispatches,
 			};
+			memcpy(job->commands[job->n_commands - 1].programs,
+			    dispatches, ndispatches * sizeof(dispatches[0]));
 			ret = agx_add_stamps(job,
 			    &job->commands[job->n_commands - 1], &cmd.ts,
 			    cmd.ts_end_copies);
@@ -1443,6 +1481,14 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 			if ((ret = agx_parse_programs(buf + off, hdr.size,
 			    programs, &nprograms)) != 0) {
 				printf("agxdrm: render programs refused: %d\n",
+				    ret);
+				return (ret);
+			}
+			break;
+		case DRM_ASAHI_SET_COMPUTE_RESOURCES:
+			if ((ret = agx_parse_dispatches(buf + off, hdr.size,
+			    dispatches, &ndispatches)) != 0) {
+				printf("agxdrm: compute programs refused: %d\n",
 				    ret);
 				return (ret);
 			}
