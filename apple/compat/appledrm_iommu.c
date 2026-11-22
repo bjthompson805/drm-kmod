@@ -1181,17 +1181,21 @@ appledrm_dma_mmap_attrs(struct device *dev, struct vm_area_struct *vma, void *cp
 
 	if (a == NULL)
 		return (-ENXIO);
+	if (size > a->size - (handle - a->iova))
+		return (-EINVAL);
 	if (!appledrm_dev_is_dma_coherent(dev) || (attrs & DMA_ATTR_WRITE_COMBINE))
 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-	return (remap_pfn_range(vma, vma->vm_start, atop(a->pa + (handle - a->iova)),
-	    vma->vm_end - vma->vm_start, vma->vm_page_prot));
+
+	/* LinuxKPI creates the GEM pager after the mmap callback returns. */
+	return (io_remap_pfn_range(vma, vma->vm_start,
+	    atop(a->pa + (handle - a->iova)), size, vma->vm_page_prot));
 }
 
 int
 dma_mmap_pages(struct device *dev, struct vm_area_struct *vma, size_t size, struct page *page)
 {
-	return (remap_pfn_range(vma, vma->vm_start, atop(VM_PAGE_TO_PHYS(page)),
-	    vma->vm_end - vma->vm_start, vma->vm_page_prot));
+	return (io_remap_pfn_range(vma, vma->vm_start,
+	    atop(VM_PAGE_TO_PHYS(page)), size, vma->vm_page_prot));
 }
 
 int
