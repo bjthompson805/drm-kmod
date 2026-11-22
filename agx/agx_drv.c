@@ -64,6 +64,8 @@ struct agx_queue {
 struct agx_vm {
 	struct list_head	bindings;
 	struct list_head	queues;
+	struct list_head	ts_objects;	/* GEM_BIND_OBJECT timestamps */
+	u32			next_ts_handle;
 	wait_queue_head_t	idle;
 	atomic_t		pending;
 	u32			vm_id;
@@ -107,6 +109,56 @@ struct agx_binding {
 
 #define	to_agx(d)	container_of(d, struct agx_drm, drm)
 #define	to_bo(o)	container_of(o, struct agx_bo, base)
+
+/*
+ * A BO range bound as a timestamp buffer. The M5 firmware writes stamps
+ * only inside its own timestamp aperture, so the driver publishes them from
+ * the CPU when a command completes, as Aurora's G16 runtime does
+ * (g16/poll.rs publish_timestamps): before the queue's next command runs
+ * and before the job's fence signals.
+ */
+struct agx_ts_object {
+	struct list_head	link;
+	struct drm_gem_object	*obj;	/* referenced */
+	u64			offset;
+	u64			range;
+	u32			handle;
+};
+
+static struct agx_ts_object *
+agx_find_ts_object(struct agx_vm *vm, u32 handle)
+{
+	struct agx_ts_object *ts;
+
+	list_for_each_entry(ts, &vm->ts_objects, link)
+		if (ts->handle == handle)
+			return (ts);
+	return (NULL);
+}
+
+/* The GET_TIME timebase, in nanoseconds (AGX_TIMESTAMP_HZ). */
+static u64
+agx_now(void)
+{
+	uint64_t ticks, frequency;
+
+	ticks = READ_SPECIALREG(cntpct_el0);
+	frequency = READ_SPECIALREG(cntfrq_el0);
+	return (ticks / frequency * AGX_TIMESTAMP_HZ +
+	    ticks % frequency * AGX_TIMESTAMP_HZ / frequency);
+}
+
+static void
+agx_free_ts_objects(struct agx_vm *vm)
+{
+	struct agx_ts_object *ts, *next;
+
+	list_for_each_entry_safe(ts, next, &vm->ts_objects, link) {
+		list_del(&ts->link);
+		drm_gem_object_put(ts->obj);
+		kfree(ts);
+	}
+}
 
 /*
  * The firmware can follow arbitrary pointers from a command stream. Keep
@@ -171,6 +223,7 @@ agx_open(struct drm_device *drm, struct drm_file *file)
 		return (-ENOMEM);
 	INIT_LIST_HEAD(&vm->bindings);
 	INIT_LIST_HEAD(&vm->queues);
+	INIT_LIST_HEAD(&vm->ts_objects);
 	init_waitqueue_head(&vm->idle);
 	atomic_set(&vm->pending, 0);
 	file->driver_priv = vm;
@@ -216,6 +269,7 @@ agx_postclose(struct drm_device *drm, struct drm_file *file)
 	list_for_each_entry(queue, &vm->queues, link)
 		apple_agx_queue_destroy(agx->gpu, queue->slot);
 	agx_drop_bindings(agx, vm, false);
+	agx_free_ts_objects(vm);
 	quarantined = vm->quarantined;
 	if (vm->context != 0 && !quarantined)
 		apple_agx_vm_destroy(agx->gpu, vm->context);
@@ -418,14 +472,74 @@ agx_ioctl_get_time(struct drm_device *drm, void *data, struct drm_file *file)
 {
 	struct drm_asahi_get_time *args = data;
 
-	uint64_t ticks, frequency;
-
 	if (args->flags != 0)
 		return (-EINVAL);
-	ticks = READ_SPECIALREG(cntpct_el0);
-	frequency = READ_SPECIALREG(cntfrq_el0);
-	args->gpu_timestamp = ticks / frequency * AGX_TIMESTAMP_HZ +
-	    ticks % frequency * AGX_TIMESTAMP_HZ / frequency;
+	args->gpu_timestamp = agx_now();
+	return (0);
+}
+
+/*
+ * DRM_IOCTL_ASAHI_GEM_BIND_OBJECT: bind a BO range as a timestamp buffer.
+ * Handles are per file and nonzero. A submit takes its own GEM reference for
+ * each stamp, so unbinding or closing the BO while it runs is safe.
+ */
+static int
+agx_ioctl_gem_bind_object(struct drm_device *drm, void *data,
+    struct drm_file *file)
+{
+	struct agx_drm *agx = to_agx(drm);
+	struct agx_vm *vm = file->driver_priv;
+	struct drm_asahi_gem_bind_object *args = data;
+	struct agx_ts_object *ts, *next;
+	struct drm_gem_object *obj;
+
+	if (args->vm_id != 0 || args->pad != 0)
+		return (-EINVAL);
+	if (args->op == DRM_ASAHI_BIND_OBJECT_OP_UNBIND) {
+		if (args->flags != 0 || args->handle != 0 ||
+		    args->offset != 0 || args->range != 0)
+			return (-EINVAL);
+		mutex_lock(&agx->lock);
+		list_for_each_entry_safe(ts, next, &vm->ts_objects, link) {
+			if (ts->handle == args->object_handle) {
+				list_del(&ts->link);
+				mutex_unlock(&agx->lock);
+				drm_gem_object_put(ts->obj);
+				kfree(ts);
+				return (0);
+			}
+		}
+		mutex_unlock(&agx->lock);
+		return (-ENOENT);
+	}
+	if (args->op != DRM_ASAHI_BIND_OBJECT_OP_BIND ||
+	    args->flags != DRM_ASAHI_BIND_OBJECT_USAGE_TIMESTAMPS ||
+	    args->object_handle != 0 || args->range == 0 ||
+	    (args->offset & 7) != 0 || (args->range & 7) != 0)
+		return (-EINVAL);
+	obj = drm_gem_object_lookup(file, args->handle);
+	if (obj == NULL)
+		return (-ENOENT);
+	if (args->offset > to_bo(obj)->size ||
+	    args->range > to_bo(obj)->size - args->offset) {
+		drm_gem_object_put(obj);
+		return (-EINVAL);
+	}
+	ts = kzalloc(sizeof(*ts), GFP_KERNEL);
+	if (ts == NULL) {
+		drm_gem_object_put(obj);
+		return (-ENOMEM);
+	}
+	ts->obj = obj;
+	ts->offset = args->offset;
+	ts->range = args->range;
+	mutex_lock(&agx->lock);
+	do {
+		ts->handle = ++vm->next_ts_handle;
+	} while (ts->handle == 0 || agx_find_ts_object(vm, ts->handle) != NULL);
+	list_add_tail(&ts->link, &vm->ts_objects);
+	args->object_handle = ts->handle;
+	mutex_unlock(&agx->lock);
 	return (0);
 }
 
@@ -789,6 +903,15 @@ agx_ioctl_queue_destroy(struct drm_device *drm, void *data,
 
 #define	AGX_MAX_PROGRAMS	16	/* linked render programs per render */
 
+/* Start and end of each stage (render: vertex, fragment) and 8 end copies. */
+#define	AGX_MAX_STAMPS		12
+
+struct agx_stamp {
+	struct drm_gem_object	*obj;	/* referenced */
+	u64			 offset;	/* in the BO */
+	bool			 end;
+};
+
 struct agx_command {
 	bool			 render;
 	u64			 start;		/* compute: the CDM stream */
@@ -796,6 +919,9 @@ struct agx_command {
 	struct agx_render_pass	 pass;		/* render */
 	u_int			 nprograms;
 	struct agx_render_program programs[AGX_MAX_PROGRAMS];
+	u_int			 nstamps;
+	struct agx_stamp	 stamps[AGX_MAX_STAMPS];
+	u64			 started;	/* agx_now() at publication */
 };
 
 struct agx_job {
@@ -816,11 +942,30 @@ struct agx_output {
 	u64			 point;
 };
 
+/* Write a completed command's timestamps through the direct map. */
+static void
+agx_publish_stamps(struct agx_command *c, u64 now)
+{
+	struct agx_stamp *s;
+	u_int i;
+
+	for (i = 0; i < c->nstamps; i++) {
+		s = &c->stamps[i];
+		atomic_store_rel_64((volatile uint64_t *)PHYS_TO_DMAP(
+		    agx_bo_pa(to_bo(s->obj), s->offset)),
+		    s->end ? now : c->started);
+	}
+	wmb();
+}
+
 static void
 agx_job_free(struct agx_job *job)
 {
-	u32 i;
+	u32 i, j;
 
+	for (i = 0; i < job->n_commands; i++)
+		for (j = 0; j < job->commands[i].nstamps; j++)
+			drm_gem_object_put(job->commands[i].stamps[j].obj);
 	for (i = 0; i < job->n_deps; i++)
 		dma_fence_put(job->deps[i]);
 	dma_fence_put(job->done);
@@ -903,6 +1048,7 @@ agx_run_job(struct work_struct *work)
 		if (c->render && i == job->n_commands - 1) {
 			struct dma_fence *fence = dma_fence_get(job->done);
 
+			c->started = agx_now();
 			ret = -apple_agx_submit_render_async(agx->gpu,
 			    vm->context, &c->pass, c->programs, c->nprograms,
 			    agx_job_render_done, job);
@@ -926,6 +1072,7 @@ agx_run_job(struct work_struct *work)
 			if (ret != 0)
 				break;
 		}
+		c->started = agx_now();
 		if (c->render)
 			ret = -apple_agx_submit_render(agx->gpu, vm->context,
 			    &c->pass, c->programs, c->nprograms, 0);
@@ -934,6 +1081,8 @@ agx_run_job(struct work_struct *work)
 			    vm->context, c->start, c->end, 0);
 		gpu_failed = ret != 0 && ret != -EINVAL && ret != -E2BIG &&
 		    ret != -EOPNOTSUPP;
+		if (ret == 0)
+			agx_publish_stamps(c, agx_now());
 	}
 	agx_job_finish(job, ret, gpu_failed);
 }
@@ -944,6 +1093,9 @@ agx_job_render_done(void *arg, int error)
 {
 	struct agx_job *job = arg;
 
+	if (error == 0)
+		agx_publish_stamps(&job->commands[job->n_commands - 1],
+		    agx_now());
 	agx_job_finish(job, -error, error != 0);
 }
 
@@ -1141,6 +1293,57 @@ agx_parse_programs(const u8 *b, u32 size, struct agx_render_program *out,
 	return (0);
 }
 
+/*
+ * Resolve one drm_asahi_timestamp of a parsed command (already counted in
+ * job->n_commands, so agx_job_free releases what this takes).
+ */
+static int
+agx_add_stamp(struct agx_job *job, struct agx_command *c,
+    const struct drm_asahi_timestamp *t, bool end)
+{
+	struct agx_ts_object *ts;
+	int ret = 0;
+
+	if (t->handle == 0)
+		return (t->offset == 0 ? 0 : -EINVAL);
+	if (c->nstamps >= AGX_MAX_STAMPS)
+		return (-EINVAL);
+	mutex_lock(&job->agx->lock);
+	ts = agx_find_ts_object(job->vm, t->handle);
+	if (ts == NULL)
+		ret = -ENOENT;
+	else if ((t->offset & 7) != 0 || t->offset + 8ul > ts->range)
+		ret = -EINVAL;
+	else {
+		drm_gem_object_get(ts->obj);
+		c->stamps[c->nstamps++] = (struct agx_stamp){
+		    .obj = ts->obj,
+		    .offset = ts->offset + t->offset,
+		    .end = end,
+		};
+	}
+	mutex_unlock(&job->agx->lock);
+	return (ret);
+}
+
+/* A stage's start and end stamps, then (if any) the eight end copies. */
+static int
+agx_add_stamps(struct agx_job *job, struct agx_command *c,
+    const struct drm_asahi_timestamps *stage,
+    const struct drm_asahi_timestamp *copies)
+{
+	u_int i;
+	int ret;
+
+	if ((ret = agx_add_stamp(job, c, &stage->start, false)) != 0 ||
+	    (ret = agx_add_stamp(job, c, &stage->end, true)) != 0)
+		return (ret);
+	for (i = 0; copies != NULL && i < 8; i++)
+		if ((ret = agx_add_stamp(job, c, &copies[i], true)) != 0)
+			return (ret);
+	return (0);
+}
+
 static int
 agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 {
@@ -1188,6 +1391,11 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 			    .start = cmd.cdm_ctrl_stream_base,
 			    .end = cmd.cdm_ctrl_stream_end,
 			};
+			ret = agx_add_stamps(job,
+			    &job->commands[job->n_commands - 1], &cmd.ts,
+			    cmd.ts_end_copies);
+			if (ret != 0)
+				return (ret);
 			break;
 		case DRM_ASAHI_CMD_RENDER:
 			if (job->n_commands >= AGX_MAX_COMMANDS ||
@@ -1221,6 +1429,15 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 				return (ret);
 			}
 			job->n_commands++;
+			ret = agx_add_stamps(job,
+			    &job->commands[job->n_commands - 1], &render.ts_vtx,
+			    NULL);
+			if (ret == 0)
+				ret = agx_add_stamps(job,
+				    &job->commands[job->n_commands - 1],
+				    &render.ts_frag, render.ts_frag_end_copies);
+			if (ret != 0)
+				return (ret);
 			break;
 		case DRM_ASAHI_SET_RENDER_RESOURCES_V2:
 			if ((ret = agx_parse_programs(buf + off, hdr.size,
@@ -1410,6 +1627,7 @@ static const struct drm_ioctl_desc agx_ioctls[] = {
 	AGX_IOCTL(VM_BIND, agx_ioctl_vm_bind),
 	AGX_IOCTL(GEM_CREATE, agx_ioctl_gem_create),
 	AGX_IOCTL(GEM_MMAP_OFFSET, agx_ioctl_gem_mmap_offset),
+	AGX_IOCTL(GEM_BIND_OBJECT, agx_ioctl_gem_bind_object),
 	AGX_IOCTL(QUEUE_CREATE, agx_ioctl_queue_create),
 	AGX_IOCTL(QUEUE_DESTROY, agx_ioctl_queue_destroy),
 	AGX_IOCTL(SUBMIT, agx_ioctl_submit),
