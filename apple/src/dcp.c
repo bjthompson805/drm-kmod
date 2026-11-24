@@ -6569,6 +6569,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 				    "Failed to initialize RTKit\n");
 		goto err_piodma;
 	}
+	/* M5's DCP often takes 1-3 s to acknowledge AP power at startup. */
+	apple_rtkit_set_handshake_timeout(dcp->rtk, 5000);
 	ret = devm_add_action_or_reset(dev, dcp_release_rtkit, dcp);
 	if (ret)
 		goto err_piodma;
