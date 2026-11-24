@@ -26,6 +26,7 @@ SRCS	+=			\
 	opt_splash.h		\
 	opt_syscons.h		\
 	opt_teken.h		\
+	backlight_if.h		\
 	bus_if.h		\
 	fb_if.h			\
 	device_if.h		\

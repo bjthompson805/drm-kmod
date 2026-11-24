@@ -28,6 +28,10 @@
 #include <vm/pmap.h>
 #include <machine/vmparam.h>
 #include <vm/vm_dumpset.h>
+#include <sys/bus.h>
+#include <dev/backlight/backlight.h>
+
+#include "backlight_if.h"
 
 #include "dcp.h"
 #include "dcpext_drm.h"
@@ -145,11 +149,137 @@ appledrm_bl_sysctl(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
+/*
+ * backlight(9) for each registered backlight, so backlight(8) works: a child device
+ * "appledrm_bl" of the parent's newbus device carries the methods and owns the
+ * /dev/backlight node. Levels are percent of max_brightness.
+ */
+struct appledrm_bl {
+	struct sysctl_ctx_list	ctx;
+	device_t		dev;
+	struct cdev		*cdev;
+};
+
+static int
+appledrm_bl_probe(device_t dev)
+{
+	device_set_desc(dev, "Apple DCP backlight");
+	return (BUS_PROBE_NOWILDCARD);
+}
+
+static int
+appledrm_bl_attach(device_t dev)
+{
+	struct backlight_device *bd = device_get_ivars(dev);
+	struct appledrm_bl *bl = bd->priv;
+
+	bl->cdev = backlight_register("apple_panel", dev);
+	return (bl->cdev == NULL ? ENXIO : 0);
+}
+
+static int
+appledrm_bl_detach(device_t dev)
+{
+	struct backlight_device *bd = device_get_ivars(dev);
+	struct appledrm_bl *bl = bd->priv;
+
+	if (bl->cdev != NULL)
+		backlight_destroy(bl->cdev);
+	bl->cdev = NULL;
+	return (0);
+}
+
+static int
+appledrm_bl_update_status(device_t dev, struct backlight_props *props)
+{
+	struct backlight_device *bd = device_get_ivars(dev);
+	int error;
+
+	if (props->brightness > 100 || bd->props.max_brightness <= 0)
+		return (EINVAL);
+	linux_set_current(curthread);
+	mutex_lock(&bd->ops_lock);
+	bd->props.brightness = (bd->props.max_brightness * props->brightness + 50) / 100;
+	error = -backlight_update_status(bd);
+	mutex_unlock(&bd->ops_lock);
+	return (error);
+}
+
+static int
+appledrm_bl_get_status(device_t dev, struct backlight_props *props)
+{
+	struct backlight_device *bd = device_get_ivars(dev);
+	int max = bd->props.max_brightness;
+
+	if (max <= 0)
+		return (ENXIO);
+	props->brightness = (bd->props.brightness * 100 + max / 2) / max;
+	props->nlevels = 0;
+	return (0);
+}
+
+static int
+appledrm_bl_get_info(device_t dev, struct backlight_info *info)
+{
+	strlcpy(info->name, "Apple panel", sizeof(info->name));
+	info->type = BACKLIGHT_TYPE_PANEL;
+	return (0);
+}
+
+static device_method_t appledrm_bl_methods[] = {
+	DEVMETHOD(device_probe,		appledrm_bl_probe),
+	DEVMETHOD(device_attach,	appledrm_bl_attach),
+	DEVMETHOD(device_detach,	appledrm_bl_detach),
+	DEVMETHOD(backlight_update_status, appledrm_bl_update_status),
+	DEVMETHOD(backlight_get_status,	appledrm_bl_get_status),
+	DEVMETHOD(backlight_get_info,	appledrm_bl_get_info),
+	DEVMETHOD_END
+};
+
+static driver_t appledrm_bl_driver = { "appledrm_bl", appledrm_bl_methods, 0 };
+
+static void
+appledrm_bl_add(struct backlight_device *bd)
+{
+	struct appledrm_bl *bl = bd->priv;
+	device_t parent;
+
+	parent = bd->parent != NULL && bd->parent->bsddev != NULL ?
+	    bd->parent->bsddev : root_bus;
+	bus_topo_lock();
+	bl->dev = device_add_child(parent, "appledrm_bl", DEVICE_UNIT_ANY);
+	if (bl->dev != NULL) {
+		device_set_driver(bl->dev, &appledrm_bl_driver);
+		device_set_ivars(bl->dev, bd);
+		if (device_probe_and_attach(bl->dev) != 0) {
+			device_delete_child(parent, bl->dev);
+			bl->dev = NULL;
+		}
+	}
+	bus_topo_unlock();
+	if (bl->dev == NULL)
+		printf("appledrm: %s: no /dev/backlight node\n", bd->name);
+}
+
+static void
+appledrm_bl_remove(struct backlight_device *bd)
+{
+	struct appledrm_bl *bl = bd->priv;
+
+	if (bl->dev == NULL)
+		return;
+	bus_topo_lock();
+	device_delete_child(device_get_parent(bl->dev), bl->dev);
+	bus_topo_unlock();
+	bl->dev = NULL;
+}
+
 struct backlight_device *
 backlight_device_register(const char *name, struct device *parent, void *devdata,
     const struct backlight_ops *ops, const struct backlight_properties *props)
 {
 	struct backlight_device *bd = kzalloc(sizeof(*bd), GFP_KERNEL);
+	struct appledrm_bl *bl;
 	struct sysctl_oid *node;
 	struct sysctl_ctx_list *ctx;
 	char sname[64];
@@ -167,9 +297,10 @@ backlight_device_register(const char *name, struct device *parent, void *devdata
 	for (c = sname; *c; c++)
 		if (*c == '-' || *c == '.')
 			*c = '_';
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	bl = kzalloc(sizeof(*bl), GFP_KERNEL);
+	ctx = &bl->ctx;
 	sysctl_ctx_init(ctx);
-	bd->priv = ctx;
+	bd->priv = bl;
 	node = SYSCTL_ADD_NODE(ctx, SYSCTL_STATIC_CHILDREN(_hw_appledrm), OID_AUTO, sname,
 	    CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, "backlight");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(node), OID_AUTO, "brightness",
@@ -177,15 +308,20 @@ backlight_device_register(const char *name, struct device *parent, void *devdata
 	    "backlight brightness");
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(node), OID_AUTO, "max_brightness", CTLFLAG_RD,
 	    &bd->props.max_brightness, 0, "maximum brightness");
+	appledrm_bl_add(bd);
 	return (bd);
 }
 
 void
 backlight_device_unregister(struct backlight_device *bd)
 {
+	struct appledrm_bl *bl;
+
 	if (bd == NULL)
 		return;
-	sysctl_ctx_free(bd->priv);
+	bl = bd->priv;
+	appledrm_bl_remove(bd);
+	sysctl_ctx_free(&bl->ctx);
 	kfree(bd->priv);
 	kfree(bd->name);
 	kfree(bd);
