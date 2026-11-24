@@ -170,6 +170,48 @@ DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
 #define DART_PAGE_SIZE 16384
 
+/*
+ * M5: unmapping a freed scanout buffer from dart-disp0 SID 0 crashes the DCP
+ * (STT mismatch on a neighbouring live buffer, then axi_rd_err), e.g. when a
+ * compositor exits. Keep a freed buffer's memory and DART mapping instead;
+ * imported buffers are not ours and are released as usual.
+ */
+static void apple_drm_gem_free_keep(struct drm_gem_object *obj)
+{
+	struct drm_gem_dma_object *dma_obj = to_drm_gem_dma_obj(obj);
+
+	if (obj->import_attach) {
+		drm_gem_dma_free(dma_obj);
+		return;
+	}
+	if (dma_obj->vaddr)
+		drm_dbg(obj->dev, "keeping freed buffer at %pad (%zu bytes)\n",
+			&dma_obj->dma_addr, obj->size);
+	drm_gem_object_release(obj);
+	kfree(dma_obj);
+}
+
+static const struct drm_gem_object_funcs apple_drm_gem_funcs = {
+	.free = apple_drm_gem_free_keep,
+	.print_info = drm_gem_dma_object_print_info,
+	.get_sg_table = drm_gem_dma_object_get_sg_table,
+	.vmap = drm_gem_dma_object_vmap,
+	.mmap = drm_gem_dma_object_mmap,
+	.vm_ops = &drm_gem_dma_vm_ops,
+};
+
+static struct drm_gem_object *apple_drm_gem_create_object(struct drm_device *drm,
+							  size_t size)
+{
+	struct drm_gem_dma_object *dma_obj;
+
+	dma_obj = kzalloc(sizeof(*dma_obj), GFP_KERNEL);
+	if (!dma_obj)
+		return ERR_PTR(-ENOMEM);
+	dma_obj->base.funcs = &apple_drm_gem_funcs;
+	return &dma_obj->base;
+}
+
 static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
                             struct drm_device *drm,
                             struct drm_mode_create_dumb *args)
@@ -294,6 +336,7 @@ static void apple_drm_postclose(struct drm_device *drm, struct drm_file *file)
 
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
+	.gem_create_object	= apple_drm_gem_create_object,
 #ifdef CONFIG_DRM_FBDEV_EMULATION
 	.fbdev_probe		= apple_drm_fbdev_probe,
 #else
