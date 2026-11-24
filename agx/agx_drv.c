@@ -689,27 +689,37 @@ agx_remove_interval(struct agx_drm *agx, struct agx_vm *vm, uint64_t start,
 	return (0);
 }
 
-/* Map range bytes of bo from offset at va, one page at a time. */
+/* Map range bytes of bo from offset at va. */
 static int
 agx_map_pages(struct agx_drm *agx, struct agx_vm *vm, uint64_t va,
     struct agx_bo *bo, uint64_t offset, uint64_t range, u_int flags)
 {
-	uint64_t off;
-	int ret;
 
 	if ((flags & APPLE_AGX_VM_SINGLE) != 0)
 		return (-apple_agx_vm_map(agx->gpu, vm->context, va,
 		    agx_bo_pa(bo, offset), range, flags));
-	for (off = 0; off < range; off += AGX_PAGE) {
-		ret = -apple_agx_vm_map(agx->gpu, vm->context, va + off,
-		    agx_bo_pa(bo, offset + off), AGX_PAGE, flags);
-		if (ret != 0) {
-			if (off != 0)
-				apple_agx_vm_unmap(agx->gpu, vm->context, va, off);
-			return (ret);
-		}
-	}
-	return (0);
+	return (-apple_agx_vm_map_list(agx->gpu, vm->context, va,
+	    &bo->pages[offset / AGX_PAGE], range / AGX_PAGE, flags));
+}
+
+/*
+ * Whether an op can change a translation the GPU may be using: an unbind, or
+ * a map over an existing binding. A map into empty VA can't, so it needn't
+ * wait for the VM's work to drain; for a compositor, that wait is a frame.
+ */
+static bool
+agx_bind_needs_idle(struct agx_vm *vm, const struct drm_asahi_gem_bind_op *op)
+{
+	struct agx_binding *binding;
+	uint64_t end;
+
+	if (op->flags == DRM_ASAHI_BIND_UNBIND)
+		return (true);
+	end = op->addr + op->range;
+	list_for_each_entry(binding, &vm->bindings, link)
+		if (binding->start < end && op->addr < binding->end)
+			return (true);
+	return (false);
 }
 
 static int
@@ -806,7 +816,8 @@ agx_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file *file)
 		    (u64)i * args->stride), sizeof(op)))
 			return (-EFAULT);
 		mutex_lock(&agx->lock);
-		if (vm->live && args->vm_id == vm->vm_id)
+		if (vm->live && args->vm_id == vm->vm_id &&
+		    agx_bind_needs_idle(vm, &op))
 			ret = agx_wait_idle_locked(agx, vm, &vm->pending, true);
 		if (ret == 0) {
 			if (!vm->live || args->vm_id != vm->vm_id)
