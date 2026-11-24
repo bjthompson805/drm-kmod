@@ -1098,6 +1098,14 @@ agx_job_render_done(void *arg, int error)
 	if (error == 0)
 		agx_publish_stamps(&job->commands[job->n_commands - 1],
 		    agx_now());
+	/*
+	 * ECANCELED: a firmware recovery dropped this render and the GPU
+	 * resumed. The VM fails with EIO; the device stays usable.
+	 */
+	if (error == ECANCELED) {
+		agx_job_finish(job, -EIO, false);
+		return;
+	}
 	agx_job_finish(job, -error, error != 0);
 }
 
