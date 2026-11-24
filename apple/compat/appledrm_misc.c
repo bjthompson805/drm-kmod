@@ -247,11 +247,15 @@ appledrm_bl_add(struct backlight_device *bd)
 	parent = bd->parent != NULL && bd->parent->bsddev != NULL ?
 	    bd->parent->bsddev : root_bus;
 	bus_topo_lock();
+	/*
+	 * The parent (usually an appledrm_node, which has no driver) offers no driver to
+	 * probe, so set ours by hand and attach it directly.
+	 */
 	bl->dev = device_add_child(parent, "appledrm_bl", DEVICE_UNIT_ANY);
 	if (bl->dev != NULL) {
-		device_set_driver(bl->dev, &appledrm_bl_driver);
 		device_set_ivars(bl->dev, bd);
-		if (device_probe_and_attach(bl->dev) != 0) {
+		if (device_set_driver(bl->dev, &appledrm_bl_driver) != 0 ||
+		    appledrm_bl_probe(bl->dev) > 0 || appledrm_bl_attach(bl->dev) != 0) {
 			device_delete_child(parent, bl->dev);
 			bl->dev = NULL;
 		}
@@ -269,6 +273,8 @@ appledrm_bl_remove(struct backlight_device *bd)
 	if (bl->dev == NULL)
 		return;
 	bus_topo_lock();
+	/* Never attached through newbus, so device_delete_child would not detach it. */
+	appledrm_bl_detach(bl->dev);
 	device_delete_child(device_get_parent(bl->dev), bl->dev);
 	bus_topo_unlock();
 	bl->dev = NULL;
