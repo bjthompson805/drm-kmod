@@ -13,6 +13,7 @@
 
 #include <sys/param.h>
 #include <sys/bus.h>
+#include <sys/sysctl.h>
 #include <vm/vm.h>
 #include <machine/cpufunc.h>
 
@@ -82,6 +83,12 @@ struct agx_drm {
 	struct apple_agx_params	params;
 	struct mutex		lock;		/* VM binding and queue state */
 	bool			gpu_failed;
+	/* GPU load: time with a command on the GPU, for the busy_ns sysctl. */
+	spinlock_t		busy_lock;
+	u_int			busy_running;
+	u64			busy_since;
+	u64			busy_ns;
+	struct sysctl_ctx_list	sysctl;
 };
 
 /* Pages are allocated one at a time: large contiguous runs are not available. */
@@ -146,6 +153,44 @@ agx_now(void)
 	frequency = READ_SPECIALREG(cntfrq_el0);
 	return (ticks / frequency * AGX_TIMESTAMP_HZ +
 	    ticks % frequency * AGX_TIMESTAMP_HZ / frequency);
+}
+
+/*
+ * GPU load accounting: the GPU counts as busy while any command is between
+ * publication and completion. busy_ns is the total; readers take the rate.
+ */
+static void
+agx_busy_begin(struct agx_drm *agx)
+{
+
+	spin_lock(&agx->busy_lock);
+	if (agx->busy_running++ == 0)
+		agx->busy_since = agx_now();
+	spin_unlock(&agx->busy_lock);
+}
+
+static void
+agx_busy_end(struct agx_drm *agx)
+{
+
+	spin_lock(&agx->busy_lock);
+	if (--agx->busy_running == 0)
+		agx->busy_ns += agx_now() - agx->busy_since;
+	spin_unlock(&agx->busy_lock);
+}
+
+static int
+agx_sysctl_busy_ns(SYSCTL_HANDLER_ARGS)
+{
+	struct agx_drm *agx = arg1;
+	uint64_t busy;
+
+	spin_lock(&agx->busy_lock);
+	busy = agx->busy_ns;
+	if (agx->busy_running != 0)
+		busy += agx_now() - agx->busy_since;
+	spin_unlock(&agx->busy_lock);
+	return (sysctl_handle_64(oidp, &busy, 0, req));
 }
 
 static void
@@ -1061,6 +1106,7 @@ agx_run_job(struct work_struct *work)
 			struct dma_fence *fence = dma_fence_get(job->done);
 
 			c->started = agx_now();
+			agx_busy_begin(agx);
 			ret = -apple_agx_submit_render_async(agx->gpu,
 			    vm->context, &c->pass, c->programs, c->nprograms,
 			    agx_job_render_done, job);
@@ -1069,6 +1115,7 @@ agx_run_job(struct work_struct *work)
 				queue->last_render = fence;
 				return;
 			}
+			agx_busy_end(agx);
 			dma_fence_put(fence);
 			gpu_failed = ret != -EINVAL && ret != -E2BIG &&
 			    ret != -EOPNOTSUPP;
@@ -1085,6 +1132,7 @@ agx_run_job(struct work_struct *work)
 				break;
 		}
 		c->started = agx_now();
+		agx_busy_begin(agx);
 		if (c->render)
 			ret = -apple_agx_submit_render(agx->gpu, vm->context,
 			    &c->pass, c->programs, c->nprograms, 0);
@@ -1092,6 +1140,7 @@ agx_run_job(struct work_struct *work)
 			ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
 			    vm->context, c->start, c->end, c->programs,
 			    c->nprograms, 0);
+		agx_busy_end(agx);
 		gpu_failed = ret != 0 && ret != -EINVAL && ret != -E2BIG &&
 		    ret != -EOPNOTSUPP;
 		if (ret == 0)
@@ -1106,6 +1155,7 @@ agx_job_render_done(void *arg, int error)
 {
 	struct agx_job *job = arg;
 
+	agx_busy_end(job->agx);
 	if (error == 0)
 		agx_publish_stamps(&job->commands[job->n_commands - 1],
 		    agx_now());
@@ -1757,9 +1807,15 @@ agxdrm_init(void)
 	agx->gpu = gpu;
 	apple_agx_get_params(gpu, &agx->params);
 	mutex_init(&agx->lock);
+	spin_lock_init(&agx->busy_lock);
 	ret = drm_dev_register(&agx->drm, 0);
 	if (ret != 0)
 		return (ret);
+	sysctl_ctx_init(&agx->sysctl);
+	SYSCTL_ADD_PROC(&agx->sysctl,
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(gpu)), OID_AUTO, "busy_ns",
+	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, agx, 0,
+	    agx_sysctl_busy_ns, "QU", "Time with a command on the GPU (ns)");
 	agx_dev = agx;
 	device_printf(gpu, "agxdrm: drm/asahi on card%d, renderD%d\n",
 	    agx->drm.primary->index, agx->drm.render->index);
@@ -1771,6 +1827,7 @@ agxdrm_exit(void)
 {
 
 	if (agx_dev != NULL) {
+		sysctl_ctx_free(&agx_dev->sysctl);
 		drm_dev_unregister(&agx_dev->drm);
 	}
 }
