@@ -83,13 +83,19 @@ struct agx_drm {
 	struct apple_agx_params	params;
 	struct mutex		lock;		/* VM binding and queue state */
 	bool			gpu_failed;
-	/* GPU load: time with a command on the GPU, for the busy_ns sysctl. */
+	/* GPU load, for the busy_ns sysctls: any command, renders, compute. */
 	spinlock_t		busy_lock;
-	u_int			busy_running;
-	u64			busy_since;
-	u64			busy_ns;
+	struct agx_busy {
+		u_int		running;
+		u64		since;
+		u64		ns;
+	}			busy[3];
 	struct sysctl_ctx_list	sysctl;
 };
+
+#define	AGX_BUSY_ANY		0
+#define	AGX_BUSY_RENDER		1
+#define	AGX_BUSY_COMPUTE	2
 
 /* Pages are allocated one at a time: large contiguous runs are not available. */
 struct agx_bo {
@@ -157,38 +163,55 @@ agx_now(void)
 
 /*
  * GPU load accounting: the GPU counts as busy while any command is between
- * publication and completion. busy_ns is the total; readers take the rate.
+ * publication and completion, and renders and compute each while one of
+ * theirs is. The counts are totals; readers take the rate. Renders and
+ * compute can overlap, so theirs may add up to more than the whole.
  */
 static void
-agx_busy_begin(struct agx_drm *agx)
+agx_busy_begin(struct agx_drm *agx, bool render)
 {
+	u64 now = agx_now();
+	int kinds[] = { AGX_BUSY_ANY,
+	    render ? AGX_BUSY_RENDER : AGX_BUSY_COMPUTE };
+	u_int i;
 
 	spin_lock(&agx->busy_lock);
-	if (agx->busy_running++ == 0)
-		agx->busy_since = agx_now();
+	for (i = 0; i < nitems(kinds); i++)
+		if (agx->busy[kinds[i]].running++ == 0)
+			agx->busy[kinds[i]].since = now;
 	spin_unlock(&agx->busy_lock);
 }
 
 static void
-agx_busy_end(struct agx_drm *agx)
+agx_busy_end(struct agx_drm *agx, bool render)
 {
+	struct agx_busy *b;
+	u64 now = agx_now();
+	int kinds[] = { AGX_BUSY_ANY,
+	    render ? AGX_BUSY_RENDER : AGX_BUSY_COMPUTE };
+	u_int i;
 
 	spin_lock(&agx->busy_lock);
-	if (--agx->busy_running == 0)
-		agx->busy_ns += agx_now() - agx->busy_since;
+	for (i = 0; i < nitems(kinds); i++) {
+		b = &agx->busy[kinds[i]];
+		if (--b->running == 0)
+			b->ns += now - b->since;
+	}
 	spin_unlock(&agx->busy_lock);
 }
 
+/* arg2: AGX_BUSY_ANY, _RENDER or _COMPUTE. */
 static int
 agx_sysctl_busy_ns(SYSCTL_HANDLER_ARGS)
 {
 	struct agx_drm *agx = arg1;
+	struct agx_busy *b = &agx->busy[arg2];
 	uint64_t busy;
 
 	spin_lock(&agx->busy_lock);
-	busy = agx->busy_ns;
-	if (agx->busy_running != 0)
-		busy += agx_now() - agx->busy_since;
+	busy = b->ns;
+	if (b->running != 0)
+		busy += agx_now() - b->since;
 	spin_unlock(&agx->busy_lock);
 	return (sysctl_handle_64(oidp, &busy, 0, req));
 }
@@ -1106,7 +1129,7 @@ agx_run_job(struct work_struct *work)
 			struct dma_fence *fence = dma_fence_get(job->done);
 
 			c->started = agx_now();
-			agx_busy_begin(agx);
+			agx_busy_begin(agx, true);
 			ret = -apple_agx_submit_render_async(agx->gpu,
 			    vm->context, &c->pass, c->programs, c->nprograms,
 			    agx_job_render_done, job);
@@ -1115,7 +1138,7 @@ agx_run_job(struct work_struct *work)
 				queue->last_render = fence;
 				return;
 			}
-			agx_busy_end(agx);
+			agx_busy_end(agx, true);
 			dma_fence_put(fence);
 			gpu_failed = ret != -EINVAL && ret != -E2BIG &&
 			    ret != -EOPNOTSUPP;
@@ -1132,7 +1155,7 @@ agx_run_job(struct work_struct *work)
 				break;
 		}
 		c->started = agx_now();
-		agx_busy_begin(agx);
+		agx_busy_begin(agx, c->render);
 		if (c->render)
 			ret = -apple_agx_submit_render(agx->gpu, vm->context,
 			    &c->pass, c->programs, c->nprograms, 0);
@@ -1140,7 +1163,7 @@ agx_run_job(struct work_struct *work)
 			ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
 			    vm->context, c->start, c->end, c->programs,
 			    c->nprograms, 0);
-		agx_busy_end(agx);
+		agx_busy_end(agx, c->render);
 		gpu_failed = ret != 0 && ret != -EINVAL && ret != -E2BIG &&
 		    ret != -EOPNOTSUPP;
 		if (ret == 0)
@@ -1155,7 +1178,7 @@ agx_job_render_done(void *arg, int error)
 {
 	struct agx_job *job = arg;
 
-	agx_busy_end(job->agx);
+	agx_busy_end(job->agx, true);
 	if (error == 0)
 		agx_publish_stamps(&job->commands[job->n_commands - 1],
 		    agx_now());
@@ -1814,8 +1837,18 @@ agxdrm_init(void)
 	sysctl_ctx_init(&agx->sysctl);
 	SYSCTL_ADD_PROC(&agx->sysctl,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(gpu)), OID_AUTO, "busy_ns",
-	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, agx, 0,
+	    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, agx, AGX_BUSY_ANY,
 	    agx_sysctl_busy_ns, "QU", "Time with a command on the GPU (ns)");
+	SYSCTL_ADD_PROC(&agx->sysctl,
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(gpu)), OID_AUTO,
+	    "render_busy_ns", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, agx,
+	    AGX_BUSY_RENDER, agx_sysctl_busy_ns, "QU",
+	    "Time with a render on the GPU (ns)");
+	SYSCTL_ADD_PROC(&agx->sysctl,
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(gpu)), OID_AUTO,
+	    "compute_busy_ns", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, agx,
+	    AGX_BUSY_COMPUTE, agx_sysctl_busy_ns, "QU",
+	    "Time with a compute dispatch on the GPU (ns)");
 	agx_dev = agx;
 	device_printf(gpu, "agxdrm: drm/asahi on card%d, renderD%d\n",
 	    agx->drm.primary->index, agx->drm.render->index);
