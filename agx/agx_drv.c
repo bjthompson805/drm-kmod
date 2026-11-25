@@ -69,6 +69,7 @@ struct agx_vm {
 	u32			next_ts_handle;
 	wait_queue_head_t	idle;
 	atomic_t		pending;
+	atomic_t		retired;	/* jobs retired: wakes full-queue submitters */
 	u32			vm_id;
 	u32			next_queue_id;
 	u_int			context;
@@ -1199,7 +1200,7 @@ agx_job_finish(struct agx_job *job, int ret, bool gpu_failed)
 	struct agx_drm *agx = job->agx;
 	struct agx_vm *vm = job->vm;
 	struct agx_queue *queue = job->queue;
-	bool queue_idle;
+	bool queue_full, queue_idle;
 
 	if (ret != 0) {
 		if (ret != -ECANCELED || gpu_failed)
@@ -1210,10 +1211,12 @@ agx_job_finish(struct agx_job *job, int ret, bool gpu_failed)
 	agx_job_free(job);
 
 	mutex_lock(&agx->lock);
+	queue_full = atomic_read(&queue->pending) >= AGX_MAX_PENDING;
 	queue_idle = atomic_dec_and_test(&queue->pending);
+	atomic_inc(&vm->retired);
 	if (atomic_dec_and_test(&vm->pending))
 		agx_drop_bindings(agx, vm, true);
-	if (queue_idle)
+	if (queue_idle || queue_full)
 		wake_up_all(&vm->idle);
 	mutex_unlock(&agx->lock);
 }
@@ -1701,19 +1704,35 @@ agx_ioctl_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	if (ret != 0)
 		goto out;
 
+	/*
+	 * A full queue applies backpressure: wait for one of its jobs to retire
+	 * instead of failing, which Mesa takes for a lost device (WoW's loading
+	 * screen submits faster than the GPU retires). The queue may go away
+	 * while the lock is dropped, so look it up again after each wait.
+	 */
 	mutex_lock(&agx->lock);
-	queue = agx_find_queue(vm, args->queue_id);
-	if (queue == NULL || queue->cancel_jobs) {
-		ret = -ENOENT;
-		goto unlock;
-	}
-	if (vm->error != 0 || agx->gpu_failed) {
-		ret = vm->error != 0 ? vm->error : -EIO;
-		goto unlock;
-	}
-	if (atomic_read(&queue->pending) >= AGX_MAX_PENDING) {
-		ret = -EBUSY;
-		goto unlock;
+	for (;;) {
+		int retired;
+
+		queue = agx_find_queue(vm, args->queue_id);
+		if (queue == NULL || queue->cancel_jobs) {
+			ret = -ENOENT;
+			goto unlock;
+		}
+		if (vm->error != 0 || agx->gpu_failed) {
+			ret = vm->error != 0 ? vm->error : -EIO;
+			goto unlock;
+		}
+		if (atomic_read(&queue->pending) < AGX_MAX_PENDING)
+			break;
+		retired = atomic_read(&vm->retired);
+		mutex_unlock(&agx->lock);
+		ret = wait_event_interruptible(vm->idle,
+		    atomic_read(&vm->retired) != retired ||
+		    READ_ONCE(agx->gpu_failed));
+		mutex_lock(&agx->lock);
+		if (ret != 0)
+			goto unlock;
 	}
 	job->done = linux_dma_fence_allocate_software(queue->fence_context,
 	    ++queue->fence_seqno);
