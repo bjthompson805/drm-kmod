@@ -53,7 +53,7 @@
 struct agx_queue {
 	struct list_head	link;
 	struct workqueue_struct	*submit_wq;
-	struct dma_fence	*last_render;	/* owned by submit_wq */
+	u64			last_render_dep;	/* owned by submit_wq */
 	atomic_t		pending;
 	u64			fence_context;
 	u64			fence_seqno;
@@ -319,7 +319,6 @@ static void
 agx_free_queue(struct agx_queue *queue)
 {
 	destroy_workqueue(queue->submit_wq);
-	dma_fence_put(queue->last_render);
 	kfree(queue);
 }
 
@@ -1027,6 +1026,10 @@ struct agx_job {
 	/* Renders published ahead of the job's last command (agx_run_job). */
 	u32			 renders_submitted;
 	u8			 render_cmds[AGX_MAX_COMMANDS];	/* their commands */
+	/* Firmware dependency words naming each published render, compute. */
+	u64			 render_dep[AGX_MAX_COMMANDS];
+	u64			 compute_dep[AGX_MAX_COMMANDS];
+	u8			 compute_cmds[AGX_MAX_COMMANDS];
 	atomic_t		 renders_done;
 	int			 render_error;	/* first error of those */
 	wait_queue_head_t	 render_wq;
@@ -1107,29 +1110,26 @@ agx_job_render_step_done(void *arg, int error)
 }
 
 /*
- * Waits until the job's first n published renders have retired (a barrier
- * of n, drm_asahi_cmd_header). Renders on the pair retire in order.
+ * Retire the job's n published computes (the compute queue runs them in
+ * order; apple_agx keeps the last in flight) and publish their stamps.
  */
 static int
-agx_job_wait_renders(struct agx_job *job, u32 n)
+agx_job_wait_computes(struct agx_job *job, u32 n, bool *gpu_failed)
 {
-	wait_event(job->render_wq, (u32)atomic_read(&job->renders_done) >= n);
-	return (job->render_error);
-}
-
-/* A barrier of 0 waits for the queue's renders of earlier submits. */
-static int
-agx_queue_wait_last_render(struct agx_queue *queue)
-{
+	u64 now;
+	u32 i;
 	int ret;
 
-	if (queue->last_render == NULL)
-		return (0);
-	ret = dma_fence_wait(queue->last_render, false);
-	if (ret == 0)
-		ret = min(0, dma_fence_get_status(queue->last_render));
-	dma_fence_put(queue->last_render);
-	queue->last_render = NULL;
+	ret = -apple_agx_compute_wait(job->agx->gpu, job->queue->slot);
+	now = agx_now();
+	for (i = 0; i < n; i++) {
+		agx_busy_end(job->agx, false);
+		if (ret == 0)
+			agx_publish_stamps(&job->commands[job->compute_cmds[i]],
+			    now);
+	}
+	if (ret != 0)
+		*gpu_failed = true;
 	return (ret);
 }
 
@@ -1140,6 +1140,8 @@ agx_run_job(struct work_struct *work)
 	struct agx_drm *agx = job->agx;
 	struct agx_vm *vm = job->vm;
 	struct agx_queue *queue = job->queue;
+	u64 *render_dep = job->render_dep, *compute_dep = job->compute_dep;
+	u32 ncomputes = 0;
 	long waited;
 	u32 i;
 	int ret;
@@ -1179,44 +1181,52 @@ agx_run_job(struct work_struct *work)
 	mutex_unlock(&agx->lock);
 	for (i = 0; i < job->n_commands && ret == 0; i++) {
 		struct agx_command *c = &job->commands[i];
+		uint64_t deps[1];
+		u_int ndeps = 0;
 
 		/*
-		 * Renders run on one pair in order and are published without
-		 * waiting: the firmware holds each tiling kick until the
-		 * previous fragment kick is done (apple_agx kick barriers), so
-		 * a render's VDM barrier is met there. A compute waits where
-		 * its VDM barrier names renders (1..N of this submit, 0 for
-		 * earlier submits). Computes run synchronously, so a CDM
-		 * barrier is always met.
+		 * Barriers become firmware dependencies, so neither queue waits
+		 * on the host. Renders run on one pair in order (the firmware
+		 * holds each tiling kick until the previous fragment kick), so
+		 * a render's VDM barrier is met there; its CDM barrier names
+		 * computes 1..N of this submit (earlier submits' computes
+		 * retired with their jobs), and the compute queue runs in
+		 * order, so the Nth implies the rest. A compute's VDM barrier
+		 * names renders 1..N, or 0 for earlier submits' (the queue's
+		 * last); its CDM barrier is met by the queue's order.
 		 */
-		if (c->render)
-			;
-		else if (c->vdm_barrier == 0)
-			ret = agx_queue_wait_last_render(queue);
-		else if (c->vdm_barrier != DRM_ASAHI_BARRIER_NONE)
-			ret = agx_job_wait_renders(job, c->vdm_barrier);
-		if (ret != 0)
-			break;
+		if (c->render) {
+			if (c->cdm_barrier != DRM_ASAHI_BARRIER_NONE &&
+			    c->cdm_barrier != 0 && c->cdm_barrier <= ncomputes)
+				deps[ndeps++] = compute_dep[c->cdm_barrier - 1];
+		} else if (c->vdm_barrier == 0) {
+			if (queue->last_render_dep != 0)
+				deps[ndeps++] = queue->last_render_dep;
+		} else if (c->vdm_barrier != DRM_ASAHI_BARRIER_NONE &&
+		    c->vdm_barrier <= job->renders_submitted)
+			deps[ndeps++] = render_dep[c->vdm_barrier - 1];
 		/*
 		 * The job's last render returns once published: its
 		 * completion finishes the job, so the queue's next job can
-		 * publish behind it.
+		 * publish behind it. The job's computes retire first.
 		 */
 		if (c->render && i == job->n_commands - 1) {
-			struct dma_fence *fence = dma_fence_get(job->done);
-
+			if (ncomputes != 0) {
+				ret = agx_job_wait_computes(job, ncomputes,
+				    &gpu_failed);
+				ncomputes = 0;
+				if (ret != 0)
+					break;
+			}
 			c->started = agx_now();
 			agx_busy_begin(agx, true);
-			ret = -apple_agx_submit_render_async(agx->gpu,
+			ret = -apple_agx_submit_render_deps(agx->gpu,
 			    vm->context, &c->pass, c->programs, c->nprograms,
+			    deps, ndeps, &queue->last_render_dep,
 			    agx_job_render_done, job);
-			if (ret == 0) {
-				dma_fence_put(queue->last_render);
-				queue->last_render = fence;
+			if (ret == 0)
 				return;
-			}
 			agx_busy_end(agx, true);
-			dma_fence_put(fence);
 			gpu_failed = ret != -EINVAL && ret != -E2BIG &&
 			    ret != -EOPNOTSUPP;
 			break;
@@ -1226,10 +1236,13 @@ agx_run_job(struct work_struct *work)
 			c->started = agx_now();
 			job->render_cmds[job->renders_submitted] = i;
 			agx_busy_begin(agx, true);
-			ret = -apple_agx_submit_render_async(agx->gpu,
+			ret = -apple_agx_submit_render_deps(agx->gpu,
 			    vm->context, &c->pass, c->programs, c->nprograms,
+			    deps, ndeps, &render_dep[job->renders_submitted],
 			    agx_job_render_step_done, job);
 			if (ret == 0) {
+				queue->last_render_dep =
+				    render_dep[job->renders_submitted];
 				job->renders_submitted++;
 				continue;
 			}
@@ -1238,23 +1251,27 @@ agx_run_job(struct work_struct *work)
 			    ret != -EOPNOTSUPP;
 			break;
 		}
-		/*
-		 * A compute waits only for the renders its VDM barrier names
-		 * (above), as on Asahi: the compute ring and the render pair
-		 * are otherwise independent.
-		 */
+		/* Published now; agx_job_wait_computes retires it. */
 		c->started = agx_now();
 		agx_busy_begin(agx, false);
-		ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
-		    vm->context, c->start, c->end, c->programs,
-		    c->nprograms, 0);
+		ret = -apple_agx_compute_kick(agx->gpu, queue->slot,
+		    vm->context, c->start, c->end, c->programs, c->nprograms,
+		    deps, ndeps, &compute_dep[ncomputes]);
+		if (ret == 0) {
+			job->compute_cmds[ncomputes++] = i;
+			continue;
+		}
 		agx_busy_end(agx, false);
-		gpu_failed = ret != 0 && ret != -EINVAL && ret != -E2BIG &&
+		gpu_failed = ret != -EINVAL && ret != -E2BIG &&
 		    ret != -EOPNOTSUPP;
-		if (ret == 0)
-			agx_publish_stamps(c, agx_now());
 	}
-	/* No callback may outlive the job: let published renders retire. */
+	/* No callback may outlive the job: let published work retire. */
+	if (ncomputes != 0) {
+		int cret = agx_job_wait_computes(job, ncomputes, &gpu_failed);
+
+		if (ret == 0)
+			ret = cret;
+	}
 	wait_event(job->render_wq,
 	    (u32)atomic_read(&job->renders_done) >= job->renders_submitted);
 	if (ret == 0)
