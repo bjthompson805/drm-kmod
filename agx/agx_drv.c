@@ -1182,11 +1182,16 @@ agx_run_job(struct work_struct *work)
 
 		/*
 		 * Renders run on one pair in order and are published without
-		 * waiting; a command waits only where its VDM barrier names
-		 * renders (1..N of this submit, 0 for earlier submits).
-		 * Computes run synchronously, so a CDM barrier is always met.
+		 * waiting: the firmware holds each tiling kick until the
+		 * previous fragment kick is done (apple_agx kick barriers), so
+		 * a render's VDM barrier is met there. A compute waits where
+		 * its VDM barrier names renders (1..N of this submit, 0 for
+		 * earlier submits). Computes run synchronously, so a CDM
+		 * barrier is always met.
 		 */
-		if (c->vdm_barrier == 0)
+		if (c->render)
+			;
+		else if (c->vdm_barrier == 0)
 			ret = agx_queue_wait_last_render(queue);
 		else if (c->vdm_barrier != DRM_ASAHI_BARRIER_NONE)
 			ret = agx_job_wait_renders(job, c->vdm_barrier);
@@ -1234,14 +1239,10 @@ agx_run_job(struct work_struct *work)
 			break;
 		}
 		/*
-		 * The compute ring has no dependency on the render pair: wait
-		 * for every render before it, of earlier submits and this one.
+		 * A compute waits only for the renders its VDM barrier names
+		 * (above), as on Asahi: the compute ring and the render pair
+		 * are otherwise independent.
 		 */
-		ret = agx_queue_wait_last_render(queue);
-		if (ret == 0)
-			ret = agx_job_wait_renders(job, job->renders_submitted);
-		if (ret != 0)
-			break;
 		c->started = agx_now();
 		agx_busy_begin(agx, false);
 		ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
