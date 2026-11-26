@@ -58,6 +58,9 @@ struct apple_rtkit {
 	int version;
 	/* How long to wait for each handshake reply from the co-processor. */
 	unsigned int handshake_timeout_ms;
+	/* Wake timeline: each message and the AP power ACK, from the wake request. */
+	bool boot_trace;
+	u64 boot_trace_start_ns;
 
 	unsigned int iop_power_state;
 	unsigned int ap_power_state;

@@ -6585,6 +6585,10 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	if (dcp->hw.adopt_live_session)
 		dev_dbg(dev, "negotiating RTKit with the running DCP\n");
 
+	/* M5's DCP intermittently ACKs AP power late (or never): time every wake. */
+	if (of_machine_is_compatible("apple,t8142"))
+		apple_rtkit_set_boot_trace(dcp->rtk, true);
+
 	/* Announce host readiness before awaiting external IOP readiness. */
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
@@ -6594,6 +6598,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	else
 		ret = apple_rtkit_wake(dcp->rtk);
 	if (ret) {
+		apple_rtkit_set_boot_trace(dcp->rtk, false);
 		ret = dev_err_probe(dev, ret, "Failed to boot RTKit: %d\n", ret);
 		goto err_piodma;
 	}

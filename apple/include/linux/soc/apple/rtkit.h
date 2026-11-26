@@ -224,6 +224,12 @@ void apple_rtkit_set_handshake_timeout(struct apple_rtkit *rtk,
 				       unsigned int timeout_ms);
 
 /*
+ * Log each message of the next wake and how long the AP power ACK took; on a
+ * timeout keep waiting, and report an ACK that comes late.
+ */
+void apple_rtkit_set_boot_trace(struct apple_rtkit *rtk, bool trace);
+
+/*
  * Handle RTKit's boot process. Should be called after the CPU of the
  * co-processor has been started.
  */

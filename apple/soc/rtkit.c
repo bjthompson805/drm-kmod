@@ -143,6 +143,12 @@ enum {
 /* Default wait for each handshake reply, see apple_rtkit_set_handshake_timeout() */
 #define APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS 1000
 
+/* Milliseconds since apple_rtkit_set_boot_trace() */
+static unsigned long apple_rtkit_trace_ms(struct apple_rtkit *rtk)
+{
+	return (unsigned long)((ktime_get_ns() - rtk->boot_trace_start_ns) / NSEC_PER_MSEC);
+}
+
 struct apple_rtkit_rx_work {
 	struct apple_rtkit *rtk;
 	u8 ep;
@@ -1663,6 +1669,10 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	 */
 	dma_rmb();
 
+	if (READ_ONCE(rtk->boot_trace))
+		dev_info(rtk->dev, "RTKit trace +%lu ms: rx ep 0x%02x msg %016llx\n",
+			 apple_rtkit_trace_ms(rtk), ep, msg.msg0);
+
 	/* A late AP ACK belongs to the timed-out request, not to any
 	 * generic completion. Mismatches retain pending and take normal dispatch
 	 * for evidence, with a permanent lane error latched.
@@ -2502,6 +2512,13 @@ void apple_rtkit_set_handshake_timeout(struct apple_rtkit *rtk,
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_set_handshake_timeout);
 
+void apple_rtkit_set_boot_trace(struct apple_rtkit *rtk, bool trace)
+{
+	rtk->boot_trace_start_ns = ktime_get_ns();
+	WRITE_ONCE(rtk->boot_trace, trace);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_boot_trace);
+
 /*
  * Expect HELLO from a firmware being restarted warm: it keeps the buffers it was
  * given and its rings, so unlike apple_rtkit_reinit() nothing is freed, and
@@ -2639,6 +2656,20 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 		return ret;
 
 	ret = apple_rtkit_wait(rtk, &rtk->ap_pwr_ack_completion);
+	if (rtk->boot_trace && ret == -ETIME) {
+		/* Keep waiting: does it answer late, or never? */
+		dev_warn(rtk->dev, "RTKit trace +%lu ms: AP power 0x%x not ACKed, waiting 30 s more\n",
+			 apple_rtkit_trace_ms(rtk), state);
+		if (wait_for_completion_timeout(&rtk->ap_pwr_ack_completion,
+						msecs_to_jiffies(30000)))
+			ret = 0;
+	}
+	if (rtk->boot_trace) {
+		dev_info(rtk->dev, "RTKit trace +%lu ms: AP power 0x%x %s (state 0x%x)\n",
+			 apple_rtkit_trace_ms(rtk), state, ret ? "never ACKed" : "ACKed",
+			 rtk->ap_power_state);
+		WRITE_ONCE(rtk->boot_trace, false);
+	}
 	if (ret)
 		return ret;
 
