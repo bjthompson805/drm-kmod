@@ -995,6 +995,8 @@ struct agx_stamp {
 
 struct agx_command {
 	bool			 render;
+	u16			 vdm_barrier;	/* drm_asahi_cmd_header */
+	u16			 cdm_barrier;
 	u64			 start;		/* compute: the CDM stream */
 	u64			 end;
 	struct agx_render_pass	 pass;		/* render */
@@ -1015,6 +1017,12 @@ struct agx_job {
 	u32			 n_deps;
 	struct agx_command	 commands[AGX_MAX_COMMANDS];
 	u32			 n_commands;
+	/* Renders published ahead of the job's last command (agx_run_job). */
+	u32			 renders_submitted;
+	u8			 render_cmds[AGX_MAX_COMMANDS];	/* their commands */
+	atomic_t		 renders_done;
+	int			 render_error;	/* first error of those */
+	wait_queue_head_t	 render_wq;
 };
 
 struct agx_output {
@@ -1074,6 +1082,50 @@ agx_record_job_error(struct agx_drm *agx, struct agx_vm *vm, int error,
 static void agx_job_finish(struct agx_job *job, int ret, bool gpu_failed);
 static void agx_job_render_done(void *arg, int error);
 
+/* A render published ahead of the job's last command retired or failed. */
+static void
+agx_job_render_step_done(void *arg, int error)
+{
+	struct agx_job *job = arg;
+	u32 n = atomic_read(&job->renders_done);
+
+	agx_busy_end(job->agx, true);
+	if (error == 0)
+		agx_publish_stamps(&job->commands[job->render_cmds[n]],
+		    agx_now());
+	else if (job->render_error == 0)
+		job->render_error = error == ECANCELED ? -EIO : -error;
+	atomic_inc(&job->renders_done);
+	wake_up_all(&job->render_wq);
+}
+
+/*
+ * Waits until the job's first n published renders have retired (a barrier
+ * of n, drm_asahi_cmd_header). Renders on the pair retire in order.
+ */
+static int
+agx_job_wait_renders(struct agx_job *job, u32 n)
+{
+	wait_event(job->render_wq, (u32)atomic_read(&job->renders_done) >= n);
+	return (job->render_error);
+}
+
+/* A barrier of 0 waits for the queue's renders of earlier submits. */
+static int
+agx_queue_wait_last_render(struct agx_queue *queue)
+{
+	int ret;
+
+	if (queue->last_render == NULL)
+		return (0);
+	ret = dma_fence_wait(queue->last_render, false);
+	if (ret == 0)
+		ret = min(0, dma_fence_get_status(queue->last_render));
+	dma_fence_put(queue->last_render);
+	queue->last_render = NULL;
+	return (ret);
+}
+
 static void
 agx_run_job(struct work_struct *work)
 {
@@ -1122,6 +1174,18 @@ agx_run_job(struct work_struct *work)
 		struct agx_command *c = &job->commands[i];
 
 		/*
+		 * Renders run on one pair in order and are published without
+		 * waiting; a command waits only where its VDM barrier names
+		 * renders (1..N of this submit, 0 for earlier submits).
+		 * Computes run synchronously, so a CDM barrier is always met.
+		 */
+		if (c->vdm_barrier == 0)
+			ret = agx_queue_wait_last_render(queue);
+		else if (c->vdm_barrier != DRM_ASAHI_BARRIER_NONE)
+			ret = agx_job_wait_renders(job, c->vdm_barrier);
+		if (ret != 0)
+			break;
+		/*
 		 * The job's last render returns once published: its
 		 * completion finishes the job, so the queue's next job can
 		 * publish behind it.
@@ -1145,31 +1209,48 @@ agx_run_job(struct work_struct *work)
 			    ret != -EOPNOTSUPP;
 			break;
 		}
-		/* The compute ring has no dependency on the render pair. */
-		if (!c->render && queue->last_render != NULL) {
-			ret = dma_fence_wait(queue->last_render, false);
-			if (ret == 0)
-				ret = min(0, dma_fence_get_status(queue->last_render));
-			dma_fence_put(queue->last_render);
-			queue->last_render = NULL;
-			if (ret != 0)
-				break;
+		if (c->render) {
+			/* Published now; agx_job_render_step_done retires it. */
+			c->started = agx_now();
+			job->render_cmds[job->renders_submitted] = i;
+			agx_busy_begin(agx, true);
+			ret = -apple_agx_submit_render_async(agx->gpu,
+			    vm->context, &c->pass, c->programs, c->nprograms,
+			    agx_job_render_step_done, job);
+			if (ret == 0) {
+				job->renders_submitted++;
+				continue;
+			}
+			agx_busy_end(agx, true);
+			gpu_failed = ret != -EINVAL && ret != -E2BIG &&
+			    ret != -EOPNOTSUPP;
+			break;
 		}
+		/*
+		 * The compute ring has no dependency on the render pair: wait
+		 * for every render before it, of earlier submits and this one.
+		 */
+		ret = agx_queue_wait_last_render(queue);
+		if (ret == 0)
+			ret = agx_job_wait_renders(job, job->renders_submitted);
+		if (ret != 0)
+			break;
 		c->started = agx_now();
-		agx_busy_begin(agx, c->render);
-		if (c->render)
-			ret = -apple_agx_submit_render(agx->gpu, vm->context,
-			    &c->pass, c->programs, c->nprograms, 0);
-		else
-			ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
-			    vm->context, c->start, c->end, c->programs,
-			    c->nprograms, 0);
-		agx_busy_end(agx, c->render);
+		agx_busy_begin(agx, false);
+		ret = -apple_agx_submit_compute(agx->gpu, queue->slot,
+		    vm->context, c->start, c->end, c->programs,
+		    c->nprograms, 0);
+		agx_busy_end(agx, false);
 		gpu_failed = ret != 0 && ret != -EINVAL && ret != -E2BIG &&
 		    ret != -EOPNOTSUPP;
 		if (ret == 0)
 			agx_publish_stamps(c, agx_now());
 	}
+	/* No callback may outlive the job: let published renders retire. */
+	wait_event(job->render_wq,
+	    (u32)atomic_read(&job->renders_done) >= job->renders_submitted);
+	if (ret == 0)
+		ret = job->render_error;
 	agx_job_finish(job, ret, gpu_failed);
 }
 
@@ -1189,6 +1270,14 @@ agx_job_render_done(void *arg, int error)
 	 */
 	if (error == ECANCELED) {
 		agx_job_finish(job, -EIO, false);
+		return;
+	}
+	/*
+	 * The job's earlier renders retired before this one (in order on
+	 * the pair), so their first error is known.
+	 */
+	if (error == 0 && job->render_error != 0) {
+		agx_job_finish(job, job->render_error, false);
 		return;
 	}
 	agx_job_finish(job, -error, error != 0);
@@ -1518,6 +1607,8 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 			    cmd.cdm_ctrl_stream_end - cmd.cdm_ctrl_stream_base < 4)
 				return (-EINVAL);
 			job->commands[job->n_commands++] = (struct agx_command){
+			    .vdm_barrier = hdr.vdm_barrier,
+			    .cdm_barrier = hdr.cdm_barrier,
 			    .start = cmd.cdm_ctrl_stream_base,
 			    .end = cmd.cdm_ctrl_stream_end,
 			    .nprograms = ndispatches,
@@ -1542,6 +1633,10 @@ agx_parse_commands(struct agx_job *job, const u8 *buf, u32 size)
 			if (nprograms == 0)
 				return (-EINVAL);
 			job->commands[job->n_commands].render = true;
+			job->commands[job->n_commands].vdm_barrier =
+			    hdr.vdm_barrier;
+			job->commands[job->n_commands].cdm_barrier =
+			    hdr.cdm_barrier;
 			job->commands[job->n_commands].nprograms = nprograms;
 			memcpy(job->commands[job->n_commands].programs, programs,
 			    nprograms * sizeof(programs[0]));
@@ -1669,6 +1764,7 @@ agx_ioctl_submit(struct drm_device *drm, void *data, struct drm_file *file)
 	job->agx = agx;
 	job->vm = vm;
 	INIT_WORK(&job->work, agx_run_job);
+	init_waitqueue_head(&job->render_wq);
 
 	n = args->in_sync_count + args->out_sync_count;
 	if (n != 0) {
