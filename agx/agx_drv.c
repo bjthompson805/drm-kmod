@@ -371,6 +371,9 @@ agx_bo_free(struct drm_gem_object *obj)
 /*
  * LinuxKPI gives the VMA its VM object only after mmap returns, so the
  * pages go in at fault time (vmf_insert_pfn), as drm-kmod's TTM does.
+ * linux_cdev_pager_populate calls us with the VM object unlocked, and the
+ * _locked insert needs it write-locked (it drops and retakes it): without
+ * the lock, concurrent faults corrupted the object and its lock word.
  */
 static vm_fault_t
 agx_bo_fault(struct vm_fault *vmf)
@@ -378,11 +381,15 @@ agx_bo_fault(struct vm_fault *vmf)
 	struct vm_area_struct *vma = vmf->vma;
 	struct agx_bo *bo = to_bo((struct drm_gem_object *)vma->vm_private_data);
 	unsigned long off = vmf->address - vma->vm_start;
+	vm_fault_t ret;
 
 	if (off >= bo->size)
 		return (VM_FAULT_SIGBUS);
-	return (lkpi_vmf_insert_pfn_prot_locked(vma, vmf->address,
-	    agx_bo_pa(bo, off) >> PAGE_SHIFT, vma->vm_page_prot));
+	VM_OBJECT_WLOCK(vma->vm_obj);
+	ret = lkpi_vmf_insert_pfn_prot_locked(vma, vmf->address,
+	    agx_bo_pa(bo, off) >> PAGE_SHIFT, vma->vm_page_prot);
+	VM_OBJECT_WUNLOCK(vma->vm_obj);
+	return (ret);
 }
 
 static int
